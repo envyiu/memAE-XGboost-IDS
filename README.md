@@ -1,4 +1,5 @@
-# IDS2 Zero-Day Benchmark
+# memAE-XGboost-IDS
+# (IDS2 Zero-Day Benchmark)
 
 Pipeline chính hiện tại là `zdr5` trên benchmark `host_disjoint_window`.
 
