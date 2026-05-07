@@ -49,8 +49,23 @@ class MemAE(nn.Module):
         x_hat = self.decoder(z_hat)
         return x_hat, z, z_hat, attn
 
+    def memory_diversity_loss(self) -> torch.Tensor:
+        normed = F.normalize(self.memory, dim=1)
+        sim = torch.matmul(normed, normed.t())
+        mask = ~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+        return sim[mask].pow(2).mean()
 
-def memae_loss(x: torch.Tensor, x_hat: torch.Tensor, attn: torch.Tensor, entropy_weight: float = 0.0002):
+
+def memae_loss(
+    x: torch.Tensor,
+    x_hat: torch.Tensor,
+    attn: torch.Tensor,
+    entropy_weight: float = 0.0002,
+    diversity_loss: torch.Tensor | None = None,
+    diversity_weight: float = 0.0,
+):
     recon = F.mse_loss(x_hat, x)
     entropy = (-attn * torch.log(attn + 1e-12)).sum(dim=1).mean()
-    return recon + entropy_weight * entropy, recon.detach(), entropy.detach()
+    diversity = diversity_loss if diversity_loss is not None else recon.new_tensor(0.0)
+    loss = recon + entropy_weight * entropy + diversity_weight * diversity
+    return loss, recon.detach(), entropy.detach(), diversity.detach()

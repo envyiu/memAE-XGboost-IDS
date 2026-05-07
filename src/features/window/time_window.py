@@ -24,6 +24,7 @@ def time_window_stats(
     include_port_diversity: bool,
     include_timing_regularity: bool,
     include_dest_concentration: bool,
+    include_beaconing_detection: bool,
     short_flow_packet_threshold: float,
     small_flow_byte_threshold: float,
     burst_gap_seconds: float,
@@ -103,6 +104,7 @@ def time_window_stats(
         dest_ip_entropy_arr = np.zeros(n, dtype=np.float32)
         single_dest_ratio_arr = np.zeros(n, dtype=np.float32)
         port_per_dest_ip_arr = np.zeros(n, dtype=np.float32)
+        dest_ip_concentration_arr = np.zeros(n, dtype=np.float32)
 
         # Sliding window state
         queue: deque[int] = deque()
@@ -285,6 +287,9 @@ def time_window_stats(
                 max_freq = max(dest_counter.values()) if dest_counter else 0
                 single_dest_ratio_arr[i] = float(max_freq) / max(count, 1.0)
                 port_per_dest_ip_arr[i] = float(len(port_counter)) / max(float(len(dest_counter)), 1.0)
+            if include_beaconing_detection:
+                max_freq = max(dest_counter.values()) if dest_counter else 0
+                dest_ip_concentration_arr[i] = float(max_freq) / max(count, 1.0)
 
         out[seconds] = {
             "flow_count": flow_count,
@@ -317,5 +322,6 @@ def time_window_stats(
             "dest_ip_entropy": dest_ip_entropy_arr,
             "single_dest_ratio": single_dest_ratio_arr,
             "port_per_dest_ip": port_per_dest_ip_arr,
+            "dest_ip_concentration": dest_ip_concentration_arr,
         }
     return out

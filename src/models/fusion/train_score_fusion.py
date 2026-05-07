@@ -5,24 +5,11 @@ from pathlib import Path
 import joblib
 import numpy as np
 import xgboost as xgb
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 
 from src.utils.io import ensure_dir, write_json
-
-
-def _predict_prob(model: xgb.XGBClassifier, X: np.ndarray) -> np.ndarray:
-    best_iteration = getattr(model, "best_iteration", None)
-    if best_iteration is not None:
-        return model.predict_proba(X, iteration_range=(0, best_iteration + 1))[:, 1]
-    return model.predict_proba(X)[:, 1]
-
-
-def _predict_prob_batched(model: xgb.XGBClassifier, X: np.ndarray, batch_size: int = 100_000) -> np.ndarray:
-    out = np.empty(len(X), dtype=np.float32)
-    for start in range(0, len(X), batch_size):
-        end = min(start + batch_size, len(X))
-        out[start:end] = _predict_prob(model, X[start:end]).astype(np.float32)
-    return out
+from src.utils.scoring import attach_selected_feature_indices, predict_prob_batched
 
 
 def _fusion_features(xgb_score: np.ndarray, memae_score: np.ndarray) -> np.ndarray:
@@ -30,6 +17,7 @@ def _fusion_features(xgb_score: np.ndarray, memae_score: np.ndarray) -> np.ndarr
     memae_score = np.asarray(memae_score, dtype=np.float32).reshape(-1, 1)
     logit_xgb = np.log(np.clip(xgb_score, 1e-6, 1 - 1e-6) / np.clip(1 - xgb_score, 1e-6, 1 - 1e-6))
     log_memae = np.log1p(np.maximum(memae_score, 0.0))
+    tanh_memae = np.tanh(log_memae / 10.0).astype(np.float32)
     return np.concatenate(
         [
             xgb_score,
@@ -37,7 +25,9 @@ def _fusion_features(xgb_score: np.ndarray, memae_score: np.ndarray) -> np.ndarr
             memae_score,
             log_memae.astype(np.float32),
             (xgb_score * log_memae).astype(np.float32),
-            np.maximum(xgb_score, np.tanh(log_memae / 10.0)).astype(np.float32),
+            np.maximum(xgb_score, tanh_memae).astype(np.float32),
+            np.abs(xgb_score - memae_score).astype(np.float32),
+            np.minimum(xgb_score, tanh_memae).astype(np.float32),
         ],
         axis=1,
     ).astype(np.float32)
@@ -56,24 +46,26 @@ def train_score_fusion(
 
     model = xgb.XGBClassifier()
     model.load_model(xgb_dir / "xgboost_model.json")
+    attach_selected_feature_indices(model, xgb_dir)
     F_train = np.load(feature_dir / "F_train.npy", mmap_mode="r")
     F_val = np.load(feature_dir / "F_val.npy", mmap_mode="r")
     y_train = np.load(processed_dir / "y_train.npy")
     y_val = np.load(processed_dir / "y_val.npy")
 
-    xgb_train = _predict_prob_batched(model, F_train)
-    xgb_val = _predict_prob_batched(model, F_val)
+    xgb_train = predict_prob_batched(model, F_train)
+    xgb_val = predict_prob_batched(model, F_val)
     memae_train = F_train[:, 0]
     memae_val = F_val[:, 0]
 
     X_train = _fusion_features(xgb_train, memae_train)
     X_val = _fusion_features(xgb_val, memae_val)
-    clf = LogisticRegression(
+    base = LogisticRegression(
         class_weight="balanced",
         max_iter=2000,
         solver="lbfgs",
         random_state=42,
     )
+    clf = CalibratedClassifierCV(base, cv=3, method="isotonic")
     clf.fit(X_train, y_train)
     joblib.dump(clf, artifact_dir / "fusion_model.joblib")
     write_json(
@@ -90,6 +82,8 @@ def train_score_fusion(
                 "log1p_memae_score",
                 "xgb_times_log1p_memae",
                 "max_xgb_tanh_memae",
+                "abs_xgb_memae_diff",
+                "min_xgb_tanh_memae",
             ],
             "train_samples": int(len(y_train)),
             "val_samples": int(len(y_val)),

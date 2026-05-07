@@ -202,13 +202,24 @@ def fit(self, data):
 
 **Transform:**
 ```python
-def transform(self, data):
+def transform(self, data, device="cpu", batch_rows=262_144):
     X = self._sanitize(data)
     X = np.clip(X, self.lower_bounds_, self.upper_bounds_)
     X = self.pipeline.transform(X)  # impute NaN → median, then standardize
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)  # final safety
     return X.astype("float32")
 ```
+
+`device="auto"` hoặc `device="cuda"` dùng Torch/CUDA cho phần transform theo batch. Logic fit vẫn giữ artifact scikit-learn như cũ để median, clipping bounds và scaler tương thích với pipeline hiện tại. Trên Colab có thể bật bằng:
+
+```bash
+python scripts/run_full_pipeline_all_families.py \
+  --preprocess-device auto \
+  --preprocess-batch-rows 262144 \
+  --preprocess-tmp-dir /content/ids2_preprocess_tmp
+```
+
+Trên Colab/Google Drive nên dùng `--preprocess-tmp-dir` trỏ tới `/content/...` để tránh ghi `open_memmap` trực tiếp lên Drive. Nếu process chết với exit code `-7`, nguyên nhân thường là `SIGBUS` từ mmap/FUSE hoặc thiếu quota đĩa, không phải Python exception.
 
 ### 3.3 Serialization
 

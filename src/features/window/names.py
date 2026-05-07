@@ -77,6 +77,8 @@ def window_feature_names(config: dict[str, Any]) -> list[str]:
         if cfg.get("include_timing_regularity"):
             names.append(f"win_inter_arrival_cv_{window}")
             names.append(f"win_inter_arrival_regularity_{window}")
+        if cfg.get("include_beaconing_detection"):
+            names.append(f"win_beaconing_score_{window}")
         if cfg.get("include_dest_concentration"):
             names.append(f"win_dest_ip_entropy_{window}")
             names.append(f"win_single_dest_ratio_{window}")
@@ -130,4 +132,6 @@ def window_feature_names(config: dict[str, Any]) -> list[str]:
             names.append(f"time_dest_ip_entropy_{seconds}s")
             names.append(f"time_single_dest_ratio_{seconds}s")
             names.append(f"time_port_per_dest_ip_{seconds}s")
+        if cfg.get("include_beaconing_detection"):
+            names.append(f"time_dest_ip_concentration_{seconds}s")
     return names

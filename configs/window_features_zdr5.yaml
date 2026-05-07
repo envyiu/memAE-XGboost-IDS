@@ -32,6 +32,7 @@ include_watched_ports: true
 include_port_diversity: true
 include_timing_regularity: true
 include_dest_concentration: true
+include_beaconing_detection: true
 short_flow_packet_threshold: 6
 small_flow_byte_threshold: 512
 burst_gap_seconds: 1.0

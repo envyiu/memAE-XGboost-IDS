@@ -44,7 +44,6 @@ src/features/window/names.py        # sinh danh sách tên feature theo config
 src/features/window/rolling.py      # primitive rolling count/sum/entropy
 src/features/window/time_window.py  # sliding window theo thời gian
 src/features/window/engine.py       # add_window_features(), orchestration chính
-src/features/window_features.py     # shim re-export để code cũ vẫn import được
 ```
 
 `engine.py` không tự quyết định config từ file YAML. Nó nhận dict config đã được đọc bởi caller. `run_preprocessing.py` là nơi đọc YAML, resolve config theo `column_schema.json`, rồi truyền vào `add_window_features()`.
@@ -376,9 +375,18 @@ time_inter_arrival_regularity_60s
 time_dest_ip_entropy_60s
 time_single_dest_ratio_60s
 time_port_per_dest_ip_60s
+time_dest_ip_concentration_60s
 ```
 
 Các seconds khác lặp lại cùng cấu trúc tên.
+
+Khi `include_beaconing_detection=true`, count-window cũng sinh thêm:
+
+```text
+win_beaconing_score_W = win_inter_arrival_regularity_W * (win_flow_count_W / W)
+```
+
+Feature này nhấn mạnh pattern callback đều đặn và đủ dày trong cùng một source group. `time_dest_ip_concentration_Ts` là `max_dest_ip_count / flow_count`, dùng để bắt pattern ít destination IP lặp lại theo thời gian.
 
 ---
 

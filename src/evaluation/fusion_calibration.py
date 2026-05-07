@@ -1,104 +1,22 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import joblib
 import numpy as np
 import xgboost as xgb
-from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
 
 from src.models.fusion.train_score_fusion import _fusion_features
 from src.utils.io import ensure_dir, read_json, write_json
-
-DEFAULT_FPR_BUDGETS = (0.001, 0.005, 0.01, 0.02, 0.05)
-
-
-def _predict_prob(model: xgb.XGBClassifier, X: np.ndarray) -> np.ndarray:
-    best_iteration = getattr(model, "best_iteration", None)
-    if best_iteration is not None:
-        return model.predict_proba(X, iteration_range=(0, best_iteration + 1))[:, 1]
-    return model.predict_proba(X)[:, 1]
-
-
-def _threshold_for_fpr(benign_score: np.ndarray, target_fpr: float) -> dict[str, float]:
-    sorted_score = np.sort(benign_score)
-    thresholds = np.unique(benign_score)
-    thresholds.sort()
-    ge_counts = benign_score.size - np.searchsorted(sorted_score, thresholds, side="left")
-    fprs = ge_counts / benign_score.size
-    valid = np.flatnonzero(fprs <= target_fpr)
-    if valid.size == 0:
-        threshold = float(np.nextafter(float(benign_score.max()), np.inf))
-        actual_fpr = 0.0
-    else:
-        threshold = float(thresholds[valid[0]])
-        actual_fpr = float(fprs[valid[0]])
-    return {"threshold": threshold, "calibration_fpr": actual_fpr, "target_fpr": float(target_fpr)}
-
-
-def _metrics(y_true: np.ndarray, family: np.ndarray, score: np.ndarray, threshold: float) -> dict[str, Any]:
-    pred = (score >= threshold).astype("int64")
-    tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
-    attack_mask = family != "benign"
-    return {
-        "threshold": float(threshold),
-        "tp": int(tp),
-        "fp": int(fp),
-        "tn": int(tn),
-        "fn": int(fn),
-        "precision": float(precision_score(y_true, pred, zero_division=0)),
-        "recall": float(recall_score(y_true, pred, zero_division=0)),
-        "z_dr": float((pred[attack_mask] == 1).mean()) if attack_mask.any() else 0.0,
-        "f1": float(f1_score(y_true, pred, zero_division=0)),
-        "fpr": float(fp / (fp + tn)) if (fp + tn) else 0.0,
-    }
-
-
-def _fpr_drift_ratio(test_fpr: float, calibration_fpr: float) -> float:
-    return float(test_fpr / max(float(calibration_fpr), 1e-12))
-
-
-def _calibration_scores(calibration_mode: str, data: dict[str, dict[str, np.ndarray]]) -> np.ndarray:
-    val_benign = data["val"]["score"][data["val"]["family"] == "benign"]
-    if calibration_mode == "val_only":
-        return val_benign
-    if calibration_mode == "val_plus_test_seen_benign":
-        seen_benign = data["test_seen"]["score"][data["test_seen"]["family"] == "benign"]
-        return np.concatenate([val_benign, seen_benign])
-    raise ValueError(f"Unknown calibration_mode: {calibration_mode}")
-
-
-def _markdown_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
-    lines = ["| " + " | ".join(columns) + " |", "| " + " | ".join(["---"] * len(columns)) + " |"]
-    for row in rows:
-        rendered = []
-        for col in columns:
-            value = row.get(col, "")
-            rendered.append(f"{value:.6f}" if isinstance(value, float) else str(value))
-        lines.append("| " + " | ".join(rendered) + " |")
-    return "\n".join(lines)
-
-
-def _render_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out = []
-    for row in rows:
-        test = row["test_zero_day"]
-        out.append(
-            {
-                "model": row["model_name"],
-                "target_fpr": row["target_fpr"],
-                "threshold": row["threshold"],
-                "cal_fpr": row["calibration_fpr"],
-                "val_fpr": row["validation_fpr"],
-                "test_fpr": test["fpr"],
-                "fpr_drift_ratio": row["fpr_drift_ratio"],
-                "zdr": test["z_dr"],
-                "f1": test["f1"],
-                "status": row["fpr_status"],
-            }
-        )
-    return out
+from src.utils.reporting import markdown_table, render_calibration_rows, with_fpr_status
+from src.utils.scoring import (
+    DEFAULT_FPR_BUDGETS,
+    attach_selected_feature_indices,
+    calibration_benign_scores,
+    metrics_at_threshold,
+    predict_prob,
+    threshold_for_fpr,
+)
 
 
 def generate_fusion_calibration_report(
@@ -123,6 +41,7 @@ def generate_fusion_calibration_report(
 
     xgb_model = xgb.XGBClassifier()
     xgb_model.load_model(xgb_dir / "xgboost_model.json")
+    attach_selected_feature_indices(xgb_model, xgb_dir)
     fusion = joblib.load(fusion_dir / "fusion_model.joblib")
 
     data = {}
@@ -130,17 +49,23 @@ def generate_fusion_calibration_report(
         F = np.load(feature_dir / f"F_{split}.npy", mmap_mode="r")
         y = np.load(processed_dir / f"y_{split}.npy")
         family = np.load(processed_dir / f"family_{split}.npy", allow_pickle=True)
-        xgb_score = _predict_prob(xgb_model, F)
+        xgb_score = predict_prob(xgb_model, F)
         memae_score = np.asarray(F[:, 0], dtype=np.float32)
         fusion_score = fusion.predict_proba(_fusion_features(xgb_score, memae_score))[:, 1]
         data[split] = {"score": fusion_score, "y": y, "family": family}
 
-    calibration_score = _calibration_scores(calibration_mode, data)
+    calibration_score = calibration_benign_scores(
+        calibration_mode,
+        data["val"],
+        data["test_seen"],
+        data["val"]["score"],
+        data["test_seen"]["score"],
+    )
     rows = []
     for target_fpr in fpr_budgets:
-        selected = _threshold_for_fpr(calibration_score, target_fpr)
-        validation = _metrics(data["val"]["y"], data["val"]["family"], data["val"]["score"], selected["threshold"])
-        test = _metrics(
+        selected = threshold_for_fpr(calibration_score, target_fpr, fallback_mode="nextafter")
+        validation = metrics_at_threshold(data["val"]["y"], data["val"]["family"], data["val"]["score"], selected["threshold"])
+        test = metrics_at_threshold(
             data["test_zero_day"]["y"],
             data["test_zero_day"]["family"],
             data["test_zero_day"]["score"],
@@ -155,19 +80,15 @@ def generate_fusion_calibration_report(
             "validation_fpr": validation["fpr"],
             "target_fpr": selected["target_fpr"],
             "validation": validation,
-            "test_seen": _metrics(
+            "test_seen": metrics_at_threshold(
                 data["test_seen"]["y"],
                 data["test_seen"]["family"],
                 data["test_seen"]["score"],
                 selected["threshold"],
             ),
             "test_zero_day": test,
-            "observed_test_fpr": test["fpr"],
-            "fpr_drift_ratio": _fpr_drift_ratio(test["fpr"], selected["calibration_fpr"]),
-            "fpr_cap": float(max_observed_test_fpr),
-            "fpr_status": "PASS" if test["fpr"] <= max_observed_test_fpr else "FAIL",
         }
-        rows.append(row)
+        rows.append(with_fpr_status(row, max_observed_test_fpr))
 
     report = {
         "experiment": experiment,
@@ -194,8 +115,8 @@ def generate_fusion_calibration_report(
         + "\n\n"
         + f"- Calibration mode: `{calibration_mode}`\n"
         + f"- FPR cap: `{max_observed_test_fpr:.6f}`\n\n"
-        + _markdown_table(
-            _render_rows(rows),
+        + markdown_table(
+            render_calibration_rows(rows),
             ["model", "target_fpr", "threshold", "cal_fpr", "val_fpr", "test_fpr", "fpr_drift_ratio", "zdr", "f1", "status"],
         )
         + "\n",

@@ -247,7 +247,12 @@ def add_window_features(df: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.Da
             for window in window_sizes:
                 data[f"win_low_slow_repeat_count_{window}"][idxs] = rolling_sum(low_slow, window)
 
-        if cfg.get("include_port_diversity") or cfg.get("include_timing_regularity") or cfg.get("include_dest_concentration"):
+        if (
+            cfg.get("include_port_diversity")
+            or cfg.get("include_timing_regularity")
+            or cfg.get("include_dest_concentration")
+            or cfg.get("include_beaconing_detection")
+        ):
             seq_ports = np.zeros(group_len, dtype=np.float32)
             if group_len > 1 and ports is not None:
                 seq_ports[1:] = (ports[1:] == ports[:-1] + 1).astype(np.float32)
@@ -265,15 +270,19 @@ def add_window_features(df: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.Da
                     data[f"win_sequential_port_ratio_{window}"][idxs] = rolling_sum(seq_ports, window) / np.maximum(flow_vals, 1.0)
                     data[f"win_high_port_ratio_{window}"][idxs] = rolling_sum(high_ports, window) / np.maximum(flow_vals, 1.0)
 
-                if cfg.get("include_timing_regularity"):
+                if cfg.get("include_timing_regularity") or cfg.get("include_beaconing_detection"):
                     iat_sum = rolling_sum(iats, window)
                     iat_sq_sum = rolling_sum(iats**2, window)
                     mean_iat = iat_sum / np.maximum(flow_vals, 1.0)
                     var_iat = np.maximum(0.0, (iat_sq_sum / np.maximum(flow_vals, 1.0)) - (mean_iat**2))
                     cv = np.sqrt(var_iat) / np.maximum(mean_iat, 1e-6)
                     cv[flow_vals <= 1] = 0.0
-                    data[f"win_inter_arrival_cv_{window}"][idxs] = cv
-                    data[f"win_inter_arrival_regularity_{window}"][idxs] = 1.0 / (1.0 + cv)
+                    regularity = 1.0 / (1.0 + cv)
+                    if cfg.get("include_timing_regularity"):
+                        data[f"win_inter_arrival_cv_{window}"][idxs] = cv
+                        data[f"win_inter_arrival_regularity_{window}"][idxs] = regularity
+                    if cfg.get("include_beaconing_detection"):
+                        data[f"win_beaconing_score_{window}"][idxs] = regularity * (flow_vals / max(float(window), 1.0))
 
             if cfg.get("include_port_diversity") or cfg.get("include_dest_concentration"):
                 for window in window_sizes:
@@ -357,6 +366,7 @@ def add_window_features(df: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.Da
                 include_port_diversity=bool(cfg.get("include_port_diversity")),
                 include_timing_regularity=bool(cfg.get("include_timing_regularity")),
                 include_dest_concentration=bool(cfg.get("include_dest_concentration")),
+                include_beaconing_detection=bool(cfg.get("include_beaconing_detection")),
                 short_flow_packet_threshold=float(cfg.get("short_flow_packet_threshold", 6)),
                 small_flow_byte_threshold=float(cfg.get("small_flow_byte_threshold", 512)),
                 burst_gap_seconds=burst_gap_seconds,
@@ -408,6 +418,8 @@ def add_window_features(df: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.Da
                     data[f"time_dest_ip_entropy_{seconds}s"][idxs] = row["dest_ip_entropy"]
                     data[f"time_single_dest_ratio_{seconds}s"][idxs] = row["single_dest_ratio"]
                     data[f"time_port_per_dest_ip_{seconds}s"][idxs] = row["port_per_dest_ip"]
+                if cfg.get("include_beaconing_detection"):
+                    data[f"time_dest_ip_concentration_{seconds}s"][idxs] = row["dest_ip_concentration"]
 
     feature_frame = pd.DataFrame(data, index=df_sorted.index)
     df_sorted = pd.concat([df_sorted, feature_frame], axis=1)

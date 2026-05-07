@@ -1,7 +1,7 @@
 experiment: zero_day_dos
 model:
   latent_dim: 48
-  memory_size: 128
+  memory_size: 256
   shrink_threshold: 0.0078125
   hidden_dims: [128, 64]
   dropout: 0.1
@@ -11,6 +11,7 @@ training:
   learning_rate: 0.0005
   weight_decay: 0.000001
   entropy_weight: 0.0002
+  memory_diversity_weight: 0.001
   patience: 12
   lr_scheduler_factor: 0.5
   lr_scheduler_patience: 3

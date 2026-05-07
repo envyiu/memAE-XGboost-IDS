@@ -16,9 +16,26 @@ from scripts.run_full_pipeline_all_families import (
     _summary_suffix,
 )
 from src.features.export_memae_features import _memae_feature_dim, export_features
-from src.features.window_features import add_window_features, window_feature_names
+from src.features.window import add_window_features, window_feature_names
+from src.models.fusion.train_score_fusion import _fusion_features
 from src.models.memae.model import MemAE
+from src.models.xgboost.train_feature_set import _memae_protected_feature_indices
+from src.preprocessing.preprocessor import IDSPreprocessor
 from src.utils.io import read_json, write_json
+from src.utils.reporting import markdown_table
+from src.utils.scoring import metrics_from_pred, predict_prob, threshold_for_fpr
+
+
+class DummyBestIterationModel:
+    best_iteration = 2
+
+    def __init__(self) -> None:
+        self.iteration_range = None
+
+    def predict_proba(self, X: np.ndarray, iteration_range: tuple[int, int] | None = None) -> np.ndarray:
+        self.iteration_range = iteration_range
+        pos = np.linspace(0.1, 0.9, len(X), dtype=np.float32)
+        return np.column_stack([1.0 - pos, pos])
 
 
 class PipelineHardeningTests(unittest.TestCase):
@@ -32,6 +49,7 @@ class PipelineHardeningTests(unittest.TestCase):
             "include_periodicity": True,
             "include_botnet_context": True,
             "include_low_slow": True,
+            "include_beaconing_detection": True,
         }
         df = pd.DataFrame(
             {
@@ -61,9 +79,71 @@ class PipelineHardeningTests(unittest.TestCase):
             "time_burst_count_60s",
             "win_low_slow_repeat_count_3",
             "time_low_slow_repeat_count_60s",
+            "win_beaconing_score_3",
+            "time_dest_ip_concentration_60s",
         ):
             self.assertIn(col, out.columns)
         self.assertTrue(np.isfinite(out[cols].to_numpy(dtype=np.float32)).all())
+        self.assertGreater(out["win_beaconing_score_3"].iloc[-1], 0.0)
+        self.assertGreaterEqual(out["time_dest_ip_concentration_60s"].iloc[-1], 0.0)
+
+    def test_predict_prob_uses_best_iteration(self) -> None:
+        model = DummyBestIterationModel()
+        score = predict_prob(model, np.zeros((4, 3), dtype=np.float32))
+        self.assertEqual(model.iteration_range, (0, 3))
+        self.assertEqual(score.shape, (4,))
+
+    def test_threshold_for_fpr_without_jitter(self) -> None:
+        selected = threshold_for_fpr(np.array([0.1, 0.2, 0.3, 0.4]), 0.25, fallback_mode="nextafter")
+        self.assertEqual(selected["threshold"], 0.4)
+        self.assertEqual(selected["calibration_fpr"], 0.25)
+
+    def test_threshold_for_fpr_with_jitter(self) -> None:
+        selected = threshold_for_fpr(
+            np.array([0.0, 0.0, 0.0, 1.0]),
+            0.25,
+            add_jitter=True,
+            fallback_mode="percentile",
+        )
+        self.assertLessEqual(selected["calibration_fpr"], 0.25)
+        self.assertGreater(selected["threshold"], 0.0)
+
+    def test_metrics_from_pred_matches_binary_counts(self) -> None:
+        metrics = metrics_from_pred(
+            np.array([0, 0, 1, 1]),
+            np.array(["benign", "benign", "dos", "dos"], dtype=object),
+            np.array([0, 1, 1, 0]),
+        )
+        self.assertEqual(metrics["tn"], 1)
+        self.assertEqual(metrics["fp"], 1)
+        self.assertEqual(metrics["tp"], 1)
+        self.assertEqual(metrics["fn"], 1)
+        self.assertEqual(metrics["z_dr"], 0.5)
+        self.assertEqual(metrics["fpr"], 0.5)
+
+    def test_markdown_table_format(self) -> None:
+        table = markdown_table([{"name": "x", "score": 0.1234567}], ["name", "score"])
+        self.assertIn("| name | score |", table)
+        self.assertIn("| x | 0.123457 |", table)
+
+    def test_memae_memory_diversity_loss_penalizes_similar_slots(self) -> None:
+        model = MemAE(2, latent_dim=2, memory_size=2, shrink_threshold=0.0)
+        with torch.no_grad():
+            model.memory.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
+        orthogonal_loss = float(model.memory_diversity_loss().detach())
+        with torch.no_grad():
+            model.memory.copy_(torch.tensor([[1.0, 0.0], [1.0, 0.0]]))
+        duplicate_loss = float(model.memory_diversity_loss().detach())
+        self.assertLess(orthogonal_loss, duplicate_loss)
+
+    def test_fusion_features_have_eight_dimensions(self) -> None:
+        features = _fusion_features(np.array([0.2, 0.8]), np.array([1.0, 3.0]))
+        self.assertEqual(features.shape, (2, 8))
+        self.assertTrue(np.isfinite(features).all())
+
+    def test_xgboost_feature_selection_keeps_memae_scalars(self) -> None:
+        indices = _memae_protected_feature_indices({"D_value": 3, "C_value": 2, "memae_feature_dim": 17}, {})
+        self.assertEqual(indices.tolist(), [0, 13, 14, 15])
 
     def test_primary_candidate_respects_fpr_cap(self) -> None:
         rows = [
@@ -91,6 +171,34 @@ class PipelineHardeningTests(unittest.TestCase):
     def test_single_family_summary_suffix_is_not_generic(self) -> None:
         self.assertEqual(_summary_suffix("targetsel", "host", ["botnet"]), "botnet_host_targetsel")
         self.assertEqual(_summary_suffix("targetsel", "host", list(DEFAULT_FAMILIES)), "host_targetsel")
+
+    def test_preprocessor_auto_device_matches_cpu_transform(self) -> None:
+        data = np.array(
+            [
+                [1.0, 10.0, -1.0],
+                [2.0, np.nan, 3.0],
+                [1000.0, 12.0, 4.0],
+                [4.0, 13.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+        preprocessor = IDSPreprocessor(["a", "b", "c"], invalid_negative_columns=["c"])
+        preprocessor.fit(data)
+        cpu = preprocessor.transform(data, device="cpu")
+        auto = preprocessor.transform(data, device="auto", batch_rows=2)
+        np.testing.assert_allclose(auto, cpu, rtol=1e-5, atol=1e-6)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_preprocessor_cuda_transform_matches_cpu_transform(self) -> None:
+        rng = np.random.default_rng(123)
+        data = rng.normal(size=(128, 5)).astype(np.float32)
+        data[::7, 1] = np.nan
+        data[::11, 3] = -5.0
+        preprocessor = IDSPreprocessor(["a", "b", "c", "d", "e"], invalid_negative_columns=["d"])
+        preprocessor.fit(data)
+        cpu = preprocessor.transform(data, device="cpu")
+        cuda = preprocessor.transform(data, device="cuda", batch_rows=17)
+        np.testing.assert_allclose(cuda, cpu, rtol=1e-5, atol=1e-6)
 
     def test_memae_export_can_append_raw_processed_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

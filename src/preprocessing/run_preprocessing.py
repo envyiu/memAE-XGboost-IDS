@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from numpy.lib.format import open_memmap
 
-from src.features.window_features import (
+from src.features.window import (
     add_window_features,
     resolve_window_config,
     window_feature_names,
@@ -14,6 +15,16 @@ from src.features.window_features import (
 )
 from src.preprocessing.preprocessor import IDSPreprocessor
 from src.utils.io import ensure_dir, read_json, read_yaml, write_json
+
+
+def _log_preprocess_device(requested_device: str, resolved_device: str, batch_rows: int) -> None:
+    if resolved_device == "cuda":
+        print(f"[preprocess] transform backend: cuda, batch_rows={batch_rows}")
+        return
+    if requested_device != "cpu":
+        print(f"[preprocess] transform backend: cpu (requested={requested_device}), batch_rows={batch_rows}")
+        return
+    print(f"[preprocess] transform backend: cpu, batch_rows={batch_rows}")
 
 
 def _load_split_ids(split_dir: Path, name: str) -> np.ndarray:
@@ -25,6 +36,30 @@ def _source_files(clean_path: Path) -> list[str]:
     return sorted(df["source_file"].dropna().astype(str).unique().tolist())
 
 
+def _tmp_output_path(final_path: Path, tmp_dir: Path | None) -> Path:
+    if tmp_dir is None:
+        return final_path
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir / final_path.name
+
+
+def _move_tmp_output(tmp_path: Path, final_path: Path) -> None:
+    if tmp_path == final_path:
+        return
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    if final_path.exists():
+        final_path.unlink()
+    shutil.move(str(tmp_path), str(final_path))
+
+
+def _save_npy(path: Path, arr: np.ndarray, tmp_dir: Path | None) -> None:
+    tmp_path = _tmp_output_path(path, tmp_dir)
+    if tmp_path.exists():
+        tmp_path.unlink()
+    np.save(tmp_path, arr)
+    _move_tmp_output(tmp_path, path)
+
+
 def preprocess_experiment(
     experiment: str = "zero_day_dos",
     clean_path: str | Path = "data/interim/cicids2017_clean.parquet",
@@ -34,11 +69,18 @@ def preprocess_experiment(
     window_config: dict | None = None,
     benchmark_mode: str | None = None,
     fit_sample_rows: int = 400_000,
+    preprocess_device: str = "cpu",
+    preprocess_batch_rows: int = 262_144,
+    preprocess_tmp_dir: str | Path | None = None,
 ) -> Path:
+    if preprocess_batch_rows <= 0:
+        raise ValueError("preprocess_batch_rows phải > 0")
+    resolved_preprocess_device = IDSPreprocessor.resolve_device(preprocess_device)
     split_dir = Path(split_dir)
     clean_path = Path(clean_path)
     processed_dir = ensure_dir(Path("data/processed") / experiment)
     preprocessor_dir = ensure_dir(Path("artifacts/preprocessors") / experiment)
+    tmp_output_dir = Path(preprocess_tmp_dir) / experiment if preprocess_tmp_dir is not None else None
 
     schema = read_json(schema_path)
     available_columns = set(schema.get("all_columns", []))
@@ -113,13 +155,22 @@ def preprocess_experiment(
     )
     preprocessor.fit(train_matrix)
     preprocessor.save(preprocessor_dir / "preprocessor.joblib")
+    _log_preprocess_device(preprocess_device, resolved_preprocess_device, preprocess_batch_rows)
     del train_matrix
     del train_chunks
 
     for name in ("train", "val", "test_seen", "test_zero_day"):
         total_rows = int(len(split_ids[name]))
+        final_x_path = processed_dir / f"X_{name}.npy"
+        tmp_x_path = _tmp_output_path(final_x_path, tmp_output_dir)
+        if tmp_x_path.exists():
+            tmp_x_path.unlink()
+        print(
+            f"[preprocess] writing {name}: rows={total_rows}, features={len(final_feature_columns)}, "
+            f"tmp={tmp_x_path}"
+        )
         X_memmap = open_memmap(
-            processed_dir / f"X_{name}.npy",
+            tmp_x_path,
             mode="w+",
             dtype="float32",
             shape=(total_rows, len(final_feature_columns)),
@@ -164,7 +215,11 @@ def preprocess_experiment(
             raw = part[final_feature_columns].to_numpy(dtype=np.float32, copy=True)
             family = part["attack_family"].to_numpy(copy=True)
             row_ids = part["row_id"].to_numpy(dtype="int64", copy=True)
-            transformed = preprocessor.transform(raw)
+            transformed = preprocessor.transform(
+                raw,
+                device=resolved_preprocess_device,
+                batch_rows=preprocess_batch_rows,
+            )
             next_offset = offset + len(part)
             X_memmap[offset:next_offset] = transformed
             row_id_arr[offset:next_offset] = row_ids
@@ -175,10 +230,13 @@ def preprocess_experiment(
             raise RuntimeError(f"Split {name} rỗng cho {experiment}")
         if offset != total_rows:
             raise RuntimeError(f"Split {name} ghi {offset} rows nhưng mong đợi {total_rows}")
+        X_memmap.flush()
         del X_memmap
-        np.save(processed_dir / f"row_id_{name}.npy", row_id_arr)
-        np.save(processed_dir / f"y_{name}.npy", y_arr)
-        np.save(processed_dir / f"family_{name}.npy", family_arr)
+        _move_tmp_output(tmp_x_path, final_x_path)
+        _save_npy(processed_dir / f"row_id_{name}.npy", row_id_arr, tmp_output_dir)
+        _save_npy(processed_dir / f"y_{name}.npy", y_arr, tmp_output_dir)
+        _save_npy(processed_dir / f"family_{name}.npy", family_arr, tmp_output_dir)
+        print(f"[preprocess] finished {name}: rows={offset}")
 
     schema_payload = {
         "experiment": experiment,
@@ -196,6 +254,9 @@ def preprocess_experiment(
         "clip_fit_scope": "train split only",
         "fit_scope": "train split only",
         "fit_sample_rows": int(min(fit_sample_rows, train_total)),
+        "preprocess_transform_backend": resolved_preprocess_device,
+        "preprocess_transform_batch_rows": int(preprocess_batch_rows),
+        "preprocess_tmp_dir": str(tmp_output_dir) if tmp_output_dir is not None else None,
         "window_features": {
             "enabled": window_enabled,
             "columns": window_columns,

@@ -77,7 +77,7 @@ Default recipe chính:
 val_plus_test_seen_benign
 ```
 
-Trong `detector_calibration.py`:
+Trong `src.utils.scoring.calibration_benign_scores()`:
 
 ```python
 val_benign = val_score[val["family"] == "benign"]
@@ -96,7 +96,7 @@ Mode default dùng thêm benign từ `test_seen`, nhưng không dùng seen attac
 
 ### 4.1 Detector calibration
 
-`detector_calibration._threshold_for_fpr(benign_score, target_fpr)`:
+`src.utils.scoring.threshold_for_fpr(benign_score, target_fpr, add_jitter=True, fallback_mode="percentile")`:
 
 1. Nếu số unique score <= 10, thêm jitter rất nhỏ `uniform(0, 1e-7)` để tránh tie quá nhiều.
 2. Sort score.
@@ -118,7 +118,7 @@ Chọn smallest threshold hợp lệ nghĩa là recall sẽ cao nhất trong cá
 
 ### 4.2 Fusion calibration
 
-`fusion_calibration._threshold_for_fpr()` tương tự nhưng không thêm jitter. Nếu không có threshold đạt target, nó dùng:
+Fusion calibration dùng cùng utility với `add_jitter=False` và `fallback_mode="nextafter"`. Nếu không có threshold đạt target, nó dùng:
 
 ```text
 nextafter(max(benign_score), +inf)
@@ -130,7 +130,7 @@ nextafter(max(benign_score), +inf)
 
 ## 5. Metrics
 
-Detector dùng `_metrics_from_pred()`:
+Detector và fusion dùng `src.utils.scoring.metrics_from_pred()` / `metrics_at_threshold()`:
 
 ```text
 tn, fp, fn, tp

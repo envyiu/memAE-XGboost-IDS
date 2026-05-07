@@ -383,6 +383,23 @@ def main() -> None:
     parser.add_argument("--max-observed-test-fpr", type=float, default=0.05)
     parser.add_argument("--include-raw-input-features", action="store_true")
     parser.add_argument(
+        "--preprocess-device",
+        choices=("cpu", "cuda", "auto"),
+        default="cpu",
+        help="Device for matrix transform in preprocessing. Use auto/cuda on Colab GPU.",
+    )
+    parser.add_argument(
+        "--preprocess-batch-rows",
+        type=int,
+        default=262_144,
+        help="Rows per CUDA transform batch during preprocessing.",
+    )
+    parser.add_argument(
+        "--preprocess-tmp-dir",
+        default=None,
+        help="Optional local temp directory for preprocessing .npy writes before moving to data/processed.",
+    )
+    parser.add_argument(
         "--raw-input-feature-pattern",
         action="append",
         default=None,
@@ -464,6 +481,9 @@ def main() -> None:
                     schema_path=args.schema_path,
                     window_config_path=args.window_config,
                     benchmark_mode=benchmark_mode,
+                    preprocess_device=args.preprocess_device,
+                    preprocess_batch_rows=args.preprocess_batch_rows,
+                    preprocess_tmp_dir=args.preprocess_tmp_dir,
                 )
             else:
                 print(f"[skip] {family}: preprocess")
@@ -548,6 +568,9 @@ def main() -> None:
         "max_observed_test_fpr": float(args.max_observed_test_fpr),
         "include_raw_input_features": bool(args.include_raw_input_features),
         "raw_input_feature_patterns": list(args.raw_input_feature_pattern or []),
+        "preprocess_device": args.preprocess_device,
+        "preprocess_batch_rows": int(args.preprocess_batch_rows),
+        "preprocess_tmp_dir": args.preprocess_tmp_dir,
         "config_paths": {
             "window": args.window_config,
             "memae": args.memae_config,

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
 import xgboost as xgb
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
 
 from src.models.xgboost.threshold_optimizer import optimize_threshold
 from src.utils.io import ensure_dir, read_json, write_json
+from src.utils.scoring import predict_prob
 from src.utils.seed import set_global_seed
+
+logger = logging.getLogger(__name__)
 
 
 def _sample_xy(
@@ -59,11 +65,61 @@ def _value_counts(values: np.ndarray | None) -> dict[str, int]:
     return {str(key): int(count) for key, count in zip(unique, counts, strict=False)}
 
 
-def _predict_prob(model: xgb.XGBClassifier, X: np.ndarray) -> np.ndarray:
-    best_iteration = getattr(model, "best_iteration", None)
-    if best_iteration is not None:
-        return model.predict_proba(X, iteration_range=(0, best_iteration + 1))[:, 1]
-    return model.predict_proba(X)[:, 1]
+def _select_features(
+    model: xgb.XGBClassifier,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    threshold: float = 0.0,
+    n_repeats: int = 3,
+    seed: int = 42,
+    protected_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict]:
+    result = permutation_importance(
+        model,
+        X_val,
+        y_val,
+        scoring="average_precision",
+        n_repeats=n_repeats,
+        random_state=seed,
+        n_jobs=1,
+    )
+    selected = np.flatnonzero(result.importances_mean > threshold)
+    protected = np.asarray(protected_indices if protected_indices is not None else [], dtype=np.int64)
+    protected = protected[(protected >= 0) & (protected < X_val.shape[1])]
+    if protected.size:
+        selected = np.union1d(selected, protected)
+    if selected.size == 0:
+        logger.warning("Feature selection selected zero features; keeping all %d features.", X_val.shape[1])
+        selected = np.arange(X_val.shape[1])
+    metadata = {
+        "enabled": True,
+        "method": "permutation_importance",
+        "scoring": "average_precision",
+        "threshold": float(threshold),
+        "n_repeats": int(n_repeats),
+        "selected_indices": selected.astype(int).tolist(),
+        "selected_feature_count": int(selected.size),
+        "original_feature_count": int(X_val.shape[1]),
+        "protected_indices": protected.astype(int).tolist(),
+        "importances_mean": result.importances_mean.astype(float).tolist(),
+        "importances_std": result.importances_std.astype(float).tolist(),
+    }
+    return selected.astype(np.int64), metadata
+
+
+def _memae_protected_feature_indices(feature_schema: dict, train_cfg: dict) -> np.ndarray:
+    configured = train_cfg.get("feature_selection_protected_indices")
+    if configured is not None:
+        return np.asarray(configured, dtype=np.int64)
+    if not train_cfg.get("feature_selection_keep_memae_scalars", True):
+        return np.array([], dtype=np.int64)
+    memae_dim = int(feature_schema.get("memae_feature_dim", feature_schema.get("total_dims_numeric", 0)) or 0)
+    input_dim = int(feature_schema.get("D_value", 0) or 0)
+    latent_dim = int(feature_schema.get("C_value", 0) or 0)
+    protected = [0]
+    scalar_start = 1 + 2 * input_dim + 3 * latent_dim
+    protected.extend([scalar_start, scalar_start + 1, scalar_start + 2])
+    return np.asarray([idx for idx in protected if 0 <= idx < memae_dim], dtype=np.int64)
 
 
 def train_xgboost_feature_set(
@@ -94,19 +150,81 @@ def train_xgboost_feature_set(
     )
     F_val_sample, y_val_sample, _ = _sample_xy(F_val, y_val, train_cfg.get("max_val_samples"), seed + 1)
     family_train_sample = family_train[train_idx] if family_train is not None and train_idx is not None else family_train
-    neg = int((y_train_sample == 0).sum())
-    pos = int((y_train_sample == 1).sum())
+    eval_positive_count = int((y_val_sample == 1).sum())
+    min_eval_positive = int(train_cfg.get("min_eval_attack_samples", 50))
+    eval_source = "official_val"
+    F_fit = F_train_sample
+    y_fit = y_train_sample
+    F_eval = F_val_sample
+    y_eval = y_val_sample
+    if eval_positive_count < min_eval_positive and int((y_train_sample == 1).sum()) >= 2:
+        eval_fraction = float(train_cfg.get("internal_eval_fraction", 0.2))
+        F_fit, F_eval, y_fit, y_eval = train_test_split(
+            F_train_sample,
+            y_train_sample,
+            test_size=eval_fraction,
+            random_state=seed + 3,
+            stratify=y_train_sample,
+        )
+        eval_source = "train_stratified_holdout"
+        logger.warning(
+            "Using train stratified holdout for XGBoost eval: official val has %d positive samples (< %d).",
+            eval_positive_count,
+            min_eval_positive,
+        )
+    neg = int((y_fit == 0).sum())
+    pos = int((y_fit == 1).sum())
     scale_pos_weight = float(neg / pos) if pos else 1.0
+
+    feature_schema = read_json(feature_dir / "memae_feature_schema.json")
+    protected_feature_indices = _memae_protected_feature_indices(feature_schema, train_cfg)
 
     params = dict(config["binary_detection"])
     early_stopping_rounds = params.pop("early_stopping_rounds")
     params["scale_pos_weight"] = scale_pos_weight
     params["early_stopping_rounds"] = early_stopping_rounds
     model = xgb.XGBClassifier(**params)
-    model.fit(F_train_sample, y_train_sample, eval_set=[(F_val_sample, y_val_sample)], verbose=True)
-    model.save_model(artifact_dir / "xgboost_model.json")
+    model.fit(F_fit, y_fit, eval_set=[(F_eval, y_eval)], verbose=True)
+    selected_indices = None
+    feature_selection_metadata = {
+        "enabled": False,
+        "selected_indices": None,
+        "selected_feature_count": int(F_train.shape[1]),
+        "original_feature_count": int(F_train.shape[1]),
+    }
+    if train_cfg.get("feature_selection"):
+        selected_indices, feature_selection_metadata = _select_features(
+            model,
+            F_eval,
+            y_eval,
+            threshold=float(train_cfg.get("feature_selection_threshold", 0.0)),
+            n_repeats=int(train_cfg.get("feature_selection_repeats", 3)),
+            seed=seed + 2,
+            protected_indices=protected_feature_indices,
+        )
+        logger.info(
+            "Retraining XGBoost with %d/%d selected features.",
+            selected_indices.size,
+            F_train_sample.shape[1],
+        )
+        model = xgb.XGBClassifier(**params)
+        model.fit(
+            F_fit[:, selected_indices],
+            y_fit,
+            eval_set=[(F_eval[:, selected_indices], y_eval)],
+            verbose=True,
+        )
+        setattr(model, "_selected_feature_indices", selected_indices)
 
-    y_val_prob = _predict_prob(model, F_val_sample)
+    best_iteration = int(getattr(model, "best_iteration", -1))
+    if best_iteration == 0:
+        logger.warning(
+            "XGBoost failed to learn (best_iteration=0). Consider adjusting hyperparameters or features."
+        )
+    model.save_model(artifact_dir / "xgboost_model.json")
+    write_json(artifact_dir / "feature_selection.json", feature_selection_metadata)
+
+    y_val_prob = predict_prob(model, F_val_sample)
     threshold = optimize_threshold(
         y_val_sample,
         y_val_prob,
@@ -120,20 +238,27 @@ def train_xgboost_feature_set(
         "weight": booster.get_score(importance_type="weight"),
         "cover": booster.get_score(importance_type="cover"),
     }
-    feature_schema = read_json(feature_dir / "memae_feature_schema.json")
     log = {
         "experiment": experiment,
         "feature_set": feature_set,
         "feature_dims": int(F_train.shape[1]),
+        "model_feature_dims": int(feature_selection_metadata["selected_feature_count"]),
         "feature_schema": feature_schema,
         "train_samples_used": int(len(y_train_sample)),
+        "fit_samples_used": int(len(y_fit)),
         "val_samples_used": int(len(y_val_sample)),
-        "class_counts_train": {"benign": neg, "malicious": pos},
+        "eval_samples_used": int(len(y_eval)),
+        "eval_source": eval_source,
+        "official_val_positive_samples": eval_positive_count,
+        "eval_positive_samples": int((y_eval == 1).sum()),
+        "class_counts_train": {"benign": int((y_train_sample == 0).sum()), "malicious": int((y_train_sample == 1).sum())},
+        "class_counts_fit": {"benign": neg, "malicious": pos},
         "family_counts_train_used": _value_counts(family_train_sample),
         "family_balance_enabled": bool(train_cfg.get("family_balance") and family_train is not None),
         "scale_pos_weight": scale_pos_weight,
-        "best_iteration": int(getattr(model, "best_iteration", -1)),
+        "best_iteration": best_iteration,
         "best_score": float(getattr(model, "best_score", 0.0)),
+        "feature_selection": feature_selection_metadata,
         "threshold": threshold,
         "evals_result": model.evals_result(),
     }

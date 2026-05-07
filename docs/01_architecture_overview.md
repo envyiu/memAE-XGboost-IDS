@@ -156,7 +156,6 @@ IDS2/
 │   │   └── run_preprocessing.py      # Orchestrate preprocessing + window features
 │   │
 │   ├── features/                     # Feature engineering
-│   │   ├── window_features.py        # Shim backward-compat (re-export)
 │   │   ├── window/                   # Window features package
 │   │   │   ├── config.py             # DEFAULT_WINDOW_CONFIG, merge, resolve
 │   │   │   ├── names.py              # window_feature_names()

@@ -35,6 +35,7 @@ DEFAULT_WINDOW_CONFIG: dict[str, Any] = {
     "include_port_diversity": False,
     "include_timing_regularity": False,
     "include_dest_concentration": False,
+    "include_beaconing_detection": True,
     "short_flow_packet_threshold": 6,
     "small_flow_byte_threshold": 512,
     "burst_gap_seconds": 1.0,
@@ -112,7 +113,13 @@ def window_required_columns(config: dict[str, Any]) -> list[str]:
         cols.add(cfg["destination_port_column"])
     if cfg.get("include_source_port_context") or cfg.get("include_botnet_context") or cfg.get("include_watched_ports"):
         cols.add(cfg["source_port_column"])
-    if cfg.get("include_unique_destination_ip") or cfg.get("include_destination_ip_count") or cfg.get("include_destination_service_count") or cfg.get("include_dest_concentration"):
+    if (
+        cfg.get("include_unique_destination_ip")
+        or cfg.get("include_destination_ip_count")
+        or cfg.get("include_destination_service_count")
+        or cfg.get("include_dest_concentration")
+        or cfg.get("include_beaconing_detection")
+    ):
         cols.add(cfg["destination_ip_column"])
     if cfg.get("include_port_diversity") or cfg.get("include_dest_concentration"):
         cols.add(cfg["destination_port_column"])
