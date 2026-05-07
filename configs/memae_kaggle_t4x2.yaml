@@ -1,0 +1,28 @@
+experiment: zero_day_dos
+model:
+  latent_dim: 48
+  memory_size: 256
+  shrink_threshold: 0.0078125
+  hidden_dims: [128, 64]
+  dropout: 0.1
+training:
+  epochs: 80
+  batch_size: 16384
+  eval_batch_size: 32768
+  learning_rate: 0.0005
+  weight_decay: 0.000001
+  entropy_weight: 0.0002
+  memory_diversity_weight: 0.001
+  patience: 12
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 3
+  min_learning_rate: 0.00001
+  max_train_samples:
+  max_val_samples:
+  num_workers: 2
+  pin_memory: true
+  data_parallel: true
+  amp: true
+selection:
+  metric: seen_recall_at_benign_fpr
+  target_fpr: 0.01

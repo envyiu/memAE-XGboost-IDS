@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,10 @@ from numpy.lib.format import open_memmap
 
 from src.models.memae.model import MemAE
 from src.utils.io import ensure_dir, read_json, write_json
+
+
+def _cuda_autocast(enabled: bool):
+    return torch.cuda.amp.autocast(enabled=True) if enabled else nullcontext()
 
 
 def _memae_feature_dim(input_dim: int, latent_dim: int) -> int:
@@ -48,7 +53,7 @@ def _batch_features(model: MemAE, batch: torch.Tensor) -> torch.Tensor:
 
 
 def _extract_to_memmap(
-    model: MemAE,
+    model: torch.nn.Module,
     X: np.ndarray,
     output_path: Path,
     device: torch.device,
@@ -56,15 +61,26 @@ def _extract_to_memmap(
     batch_size: int = 4096,
     include_raw_input: bool = False,
     raw_input_indices: list[int] | None = None,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    use_amp: bool = False,
 ) -> list[int]:
-    loader = DataLoader(TensorDataset(torch.from_numpy(np.asarray(X, dtype=np.float32))), batch_size=batch_size)
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(np.asarray(X, dtype=np.float32))),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
     out = open_memmap(output_path, mode="w+", dtype="float32", shape=(len(X), feature_dim))
     offset = 0
     model.eval()
     with torch.no_grad():
         for (batch,) in loader:
-            batch = batch.to(device)
-            features = _batch_features(model, batch).detach().cpu().numpy().astype("float32")
+            batch = batch.to(device, non_blocking=pin_memory)
+            with _cuda_autocast(use_amp and device.type == "cuda"):
+                features_t = _batch_features(model, batch)
+            features = features_t.detach().cpu().numpy().astype("float32")
             if include_raw_input:
                 raw = batch.detach().cpu().numpy().astype("float32")
                 if raw_input_indices is not None:
@@ -90,6 +106,10 @@ def export_features(
     feature_set: str | None = None,
     include_raw_input: bool = False,
     raw_input_feature_patterns: list[str] | None = None,
+    data_parallel: bool = False,
+    num_workers: int = 0,
+    pin_memory: bool | None = None,
+    amp: bool = False,
 ) -> Path:
     processed_dir = Path("data/processed") / experiment
     feature_dir = ensure_dir(Path("data/features") / (feature_set or experiment))
@@ -98,6 +118,10 @@ def export_features(
     model.load_state_dict(checkpoint["model_state_dict"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    use_data_parallel = bool(data_parallel) and device.type == "cuda" and torch.cuda.device_count() > 1
+    model_for_export: torch.nn.Module = torch.nn.DataParallel(model) if use_data_parallel else model
+    use_pin_memory = bool(pin_memory) if pin_memory is not None else device.type == "cuda"
+    use_amp = bool(amp) and device.type == "cuda"
 
     D = int(checkpoint["input_dim"])
     C = int(checkpoint["model_config"]["latent_dim"])
@@ -118,7 +142,7 @@ def export_features(
     for name in ("train", "val", "test_seen", "test_zero_day"):
         X = np.load(processed_dir / f"X_{name}.npy", mmap_mode="r")
         dims[name] = _extract_to_memmap(
-            model,
+            model_for_export,
             X,
             feature_dir / f"F_{name}.npy",
             device,
@@ -126,6 +150,9 @@ def export_features(
             batch_size=batch_size,
             include_raw_input=include_raw_input,
             raw_input_indices=raw_input_indices,
+            num_workers=num_workers,
+            pin_memory=use_pin_memory,
+            use_amp=use_amp,
         )
 
     feature_blocks = [
@@ -162,6 +189,13 @@ def export_features(
             "processed_feature_count": len(processed_schema.get("feature_order", [])),
             "processed_benchmark_mode": processed_schema.get("benchmark_mode"),
             "processed_window_features": processed_schema.get("window_features"),
+            "device": str(device),
+            "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+            "data_parallel": bool(use_data_parallel),
+            "batch_size": int(batch_size),
+            "num_workers": int(num_workers),
+            "pin_memory": bool(use_pin_memory),
+            "amp": bool(use_amp),
             "shapes": dims,
             "feature_blocks": feature_blocks,
         },

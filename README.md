@@ -29,6 +29,24 @@ Chạy riêng một family:
 .venv/bin/python scripts/run_full_pipeline_all_families.py --families botnet --force-retrain
 ```
 
+## Chạy Trên Kaggle
+
+Nếu repo nằm ở `/kaggle/working/memAE-XGboost-IDS` và dataset nằm ở `/kaggle/input/datasets/envyiu/cicids2017`, dùng notebook `IDS2_Kaggle.ipynb` hoặc chạy:
+
+```bash
+cd /kaggle/working/memAE-XGboost-IDS
+python -u scripts/run_kaggle_pipeline.py --families all --clean-data
+```
+
+Để test nhanh một family:
+
+```bash
+python -u scripts/run_kaggle_pipeline.py --families botnet --clean-data
+```
+
+Runner Kaggle mặc định dùng `--preprocess-device cuda` và ghi temp preprocess vào `/kaggle/working/ids2_preprocess_tmp`.
+Với máy 30GB RAM + 2xT4, runner dùng config `configs/memae_kaggle_t4x2.yaml` để bật MemAE `DataParallel`, AMP, batch train `16384`, batch eval/export lớn hơn; XGBoost dùng `configs/xgboost_kaggle_gpu.yaml` với `device: cuda`.
+
 Audit artifact chính:
 
 ```bash

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -15,6 +17,10 @@ from src.utils.seed import set_global_seed
 logger = logging.getLogger(__name__)
 
 
+def _cuda_autocast(enabled: bool):
+    return torch.cuda.amp.autocast(enabled=True) if enabled else nullcontext()
+
+
 def _sample(X: np.ndarray, max_samples: int | None, seed: int) -> np.ndarray:
     if not max_samples or len(X) <= max_samples:
         return X
@@ -24,29 +30,56 @@ def _sample(X: np.ndarray, max_samples: int | None, seed: int) -> np.ndarray:
 
 
 def _reconstruction_errors(
-    model: MemAE,
+    model: torch.nn.Module,
     X: np.ndarray,
     device: torch.device,
     batch_size: int,
     reduction: str = "sum",
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    use_amp: bool = False,
 ) -> np.ndarray:
     if reduction not in {"sum", "mean"}:
         raise ValueError(f"Unknown reconstruction reduction: {reduction}")
-    loader = DataLoader(TensorDataset(torch.from_numpy(np.asarray(X, dtype=np.float32))), batch_size=batch_size)
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(np.asarray(X, dtype=np.float32))),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
     errors = []
     model.eval()
     with torch.no_grad():
         for (batch,) in loader:
-            batch = batch.to(device)
-            x_hat, _, _, _ = model(batch)
+            batch = batch.to(device, non_blocking=pin_memory)
+            with _cuda_autocast(use_amp and device.type == "cuda"):
+                x_hat, _, _, _ = model(batch)
             squared = (batch - x_hat) ** 2
             err = squared.sum(dim=1) if reduction == "sum" else squared.mean(dim=1)
             errors.append(err.detach().cpu().numpy())
     return np.concatenate(errors) if errors else np.array([], dtype=np.float32)
 
 
-def _reconstruction_stats(model: MemAE, X: np.ndarray, device: torch.device, batch_size: int) -> dict:
-    values = _reconstruction_errors(model, X, device, batch_size, reduction="mean")
+def _reconstruction_stats(
+    model: torch.nn.Module,
+    X: np.ndarray,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    use_amp: bool,
+) -> dict:
+    values = _reconstruction_errors(
+        model,
+        X,
+        device,
+        batch_size,
+        reduction="mean",
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        use_amp=use_amp,
+    )
     return {
         "mean": float(values.mean()),
         "std": float(values.std()),
@@ -55,6 +88,18 @@ def _reconstruction_stats(model: MemAE, X: np.ndarray, device: torch.device, bat
         "p95": float(np.percentile(values, 95)),
         "p99": float(np.percentile(values, 99)),
     }
+
+
+def _unwrap_model(model: torch.nn.Module) -> MemAE:
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+def _model_state_dict(model: torch.nn.Module) -> dict[str, Any]:
+    return _unwrap_model(model).state_dict()
+
+
+def _memory_diversity_loss(model: torch.nn.Module) -> torch.Tensor:
+    return _unwrap_model(model).memory_diversity_loss()
 
 
 def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: str | None = None) -> Path:
@@ -79,8 +124,15 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_cfg = config["model"]
-    model = MemAE(input_dim=train_benign.shape[1], **model_cfg).to(device)
+    base_model = MemAE(input_dim=train_benign.shape[1], **model_cfg).to(device)
+    use_data_parallel = bool(training_cfg.get("data_parallel", False)) and device.type == "cuda" and torch.cuda.device_count() > 1
+    model: torch.nn.Module = torch.nn.DataParallel(base_model) if use_data_parallel else base_model
     diversity_weight = float(training_cfg.get("memory_diversity_weight", 0.0))
+    batch_size = int(training_cfg["batch_size"])
+    eval_batch_size = int(training_cfg.get("eval_batch_size", batch_size))
+    num_workers = int(training_cfg.get("num_workers", 0))
+    pin_memory = bool(training_cfg.get("pin_memory", device.type == "cuda"))
+    use_amp = bool(training_cfg.get("amp", False)) and device.type == "cuda"
     effective_selection_metric = selection_metric
     min_attack_samples = int(selection_cfg.get("min_seen_attack_samples", 10))
     if selection_metric == "seen_recall_at_benign_fpr" and len(val_attack_sample) < min_attack_samples:
@@ -104,11 +156,19 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
     )
     train_loader = DataLoader(
         TensorDataset(torch.from_numpy(train_benign)),
-        batch_size=training_cfg["batch_size"],
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=training_cfg.get("num_workers", 0),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
     )
-    val_loader = DataLoader(TensorDataset(torch.from_numpy(val_benign)), batch_size=training_cfg["batch_size"])
+    val_loader = DataLoader(
+        TensorDataset(torch.from_numpy(val_benign)),
+        batch_size=eval_batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
 
     best_val = float("inf")
     best_selection_value = float("-inf")
@@ -116,47 +176,69 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
     best_epoch = -1
     stale = 0
     history = []
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     for epoch in range(1, training_cfg["epochs"] + 1):
         model.train()
         train_losses = []
         for (batch,) in tqdm(train_loader, desc=f"MemAE epoch {epoch}", leave=False):
-            batch = batch.to(device)
+            batch = batch.to(device, non_blocking=pin_memory)
             optimizer.zero_grad(set_to_none=True)
-            x_hat, _, _, attn = model(batch)
-            loss, recon, entropy, diversity = memae_loss(
-                batch,
-                x_hat,
-                attn,
-                training_cfg["entropy_weight"],
-                diversity_loss=model.memory_diversity_loss(),
-                diversity_weight=diversity_weight,
-            )
-            loss.backward()
-            optimizer.step()
+            with _cuda_autocast(use_amp):
+                x_hat, _, _, attn = model(batch)
+                loss, recon, entropy, diversity = memae_loss(
+                    batch,
+                    x_hat,
+                    attn,
+                    training_cfg["entropy_weight"],
+                    diversity_loss=_memory_diversity_loss(model),
+                    diversity_weight=diversity_weight,
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             train_losses.append(float(loss.detach().cpu()))
 
         model.eval()
         val_losses = []
         with torch.no_grad():
             for (batch,) in val_loader:
-                batch = batch.to(device)
-                x_hat, _, _, attn = model(batch)
-                loss, _, _, _ = memae_loss(
-                    batch,
-                    x_hat,
-                    attn,
-                    training_cfg["entropy_weight"],
-                    diversity_loss=model.memory_diversity_loss(),
-                    diversity_weight=diversity_weight,
-                )
+                batch = batch.to(device, non_blocking=pin_memory)
+                with _cuda_autocast(use_amp):
+                    x_hat, _, _, attn = model(batch)
+                    loss, _, _, _ = memae_loss(
+                        batch,
+                        x_hat,
+                        attn,
+                        training_cfg["entropy_weight"],
+                        diversity_loss=_memory_diversity_loss(model),
+                        diversity_weight=diversity_weight,
+                    )
                 val_losses.append(float(loss.detach().cpu()))
 
         row = {"epoch": epoch, "train_loss": float(np.mean(train_losses)), "val_loss": float(np.mean(val_losses))}
         row["learning_rate"] = float(optimizer.param_groups[0]["lr"])
         if selection_metric == "seen_recall_at_benign_fpr":
-            benign_score = _reconstruction_errors(model, val_benign, device, training_cfg["batch_size"], reduction="sum")
+            benign_score = _reconstruction_errors(
+                model,
+                val_benign,
+                device,
+                eval_batch_size,
+                reduction="sum",
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                use_amp=use_amp,
+            )
             attack_score = (
-                _reconstruction_errors(model, val_attack_sample, device, training_cfg["batch_size"], reduction="sum")
+                _reconstruction_errors(
+                    model,
+                    val_attack_sample,
+                    device,
+                    eval_batch_size,
+                    reduction="sum",
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    use_amp=use_amp,
+                )
                 if len(val_attack_sample)
                 else np.array([], dtype=np.float32)
             )
@@ -190,7 +272,7 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
             stale = 0
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": _model_state_dict(model),
                     "input_dim": train_benign.shape[1],
                     "model_config": model_cfg,
                     "selection_metric": effective_selection_metric,
@@ -204,10 +286,26 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
         scheduler.step(row["val_loss"])
 
     checkpoint = torch.load(artifact_dir / "memae_best.pt", map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    _unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
     reconstruction_stats = {
-        "val_benign": _reconstruction_stats(model, val_benign, device, training_cfg["batch_size"]),
-        "val_seen_attack": _reconstruction_stats(model, val_attack_sample, device, training_cfg["batch_size"])
+        "val_benign": _reconstruction_stats(
+            model,
+            val_benign,
+            device,
+            eval_batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            use_amp=use_amp,
+        ),
+        "val_seen_attack": _reconstruction_stats(
+            model,
+            val_attack_sample,
+            device,
+            eval_batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            use_amp=use_amp,
+        )
         if len(val_attack_sample)
         else None,
     }
@@ -216,6 +314,13 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
         {
             "experiment": experiment,
             "device": str(device),
+            "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+            "data_parallel": bool(use_data_parallel),
+            "amp": bool(use_amp),
+            "batch_size": batch_size,
+            "eval_batch_size": eval_batch_size,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
             "best_epoch": best_epoch,
             "best_val_loss": best_val,
             "configured_selection_metric": selection_metric,

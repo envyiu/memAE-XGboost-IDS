@@ -364,6 +364,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--families", nargs="+", default=["all"])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--raw-data-dir",
+        default=DEFAULT_DATA_DIR,
+        help="Raw CIC-IDS2017 CSV/Parquet directory used when --clean-path does not exist.",
+    )
     parser.add_argument("--clean-path", default="data/interim/cicids2017_clean.parquet")
     parser.add_argument("--schema-path", default="data/interim/column_schema.json")
     parser.add_argument("--window-config", default="configs/window_features_zdr5.yaml")
@@ -382,6 +387,10 @@ def main() -> None:
     parser.add_argument("--fpr-budgets", default="0.001,0.005,0.01,0.02,0.05")
     parser.add_argument("--max-observed-test-fpr", type=float, default=0.05)
     parser.add_argument("--include-raw-input-features", action="store_true")
+    parser.add_argument("--memae-export-batch-size", type=int, default=4096)
+    parser.add_argument("--memae-export-data-parallel", action="store_true")
+    parser.add_argument("--memae-export-amp", action="store_true")
+    parser.add_argument("--memae-export-num-workers", type=int, default=0)
     parser.add_argument(
         "--preprocess-device",
         choices=("cpu", "cuda", "auto"),
@@ -393,6 +402,12 @@ def main() -> None:
         type=int,
         default=262_144,
         help="Rows per CUDA transform batch during preprocessing.",
+    )
+    parser.add_argument(
+        "--preprocess-fit-sample-rows",
+        type=int,
+        default=400_000,
+        help="Rows sampled from train split to fit preprocessing quantiles/imputer/scaler.",
     )
     parser.add_argument(
         "--preprocess-tmp-dir",
@@ -437,7 +452,8 @@ def main() -> None:
 
     clean_path = Path(args.clean_path)
     if not clean_path.exists():
-        clean_dataset(data_dir=DEFAULT_DATA_DIR, output_dir="data/interim")
+        print(f"[run] clean dataset from {args.raw_data_dir}")
+        clean_dataset(data_dir=args.raw_data_dir, output_dir=clean_path.parent)
 
     memae_config = read_yaml(args.memae_config)
     xgboost_config = read_yaml(args.xgboost_config)
@@ -481,6 +497,7 @@ def main() -> None:
                     schema_path=args.schema_path,
                     window_config_path=args.window_config,
                     benchmark_mode=benchmark_mode,
+                    fit_sample_rows=args.preprocess_fit_sample_rows,
                     preprocess_device=args.preprocess_device,
                     preprocess_batch_rows=args.preprocess_batch_rows,
                     preprocess_tmp_dir=args.preprocess_tmp_dir,
@@ -503,10 +520,14 @@ def main() -> None:
                 print(f"[run] {family}: export memae features")
                 export_features(
                     experiment,
+                    batch_size=args.memae_export_batch_size,
                     artifact_name=feature_set,
                     feature_set=feature_set,
                     include_raw_input=args.include_raw_input_features,
                     raw_input_feature_patterns=args.raw_input_feature_pattern,
+                    data_parallel=args.memae_export_data_parallel,
+                    amp=args.memae_export_amp,
+                    num_workers=args.memae_export_num_workers,
                 )
             else:
                 print(f"[skip] {family}: export memae features")
@@ -568,8 +589,13 @@ def main() -> None:
         "max_observed_test_fpr": float(args.max_observed_test_fpr),
         "include_raw_input_features": bool(args.include_raw_input_features),
         "raw_input_feature_patterns": list(args.raw_input_feature_pattern or []),
+        "memae_export_batch_size": int(args.memae_export_batch_size),
+        "memae_export_data_parallel": bool(args.memae_export_data_parallel),
+        "memae_export_amp": bool(args.memae_export_amp),
+        "memae_export_num_workers": int(args.memae_export_num_workers),
         "preprocess_device": args.preprocess_device,
         "preprocess_batch_rows": int(args.preprocess_batch_rows),
+        "preprocess_fit_sample_rows": int(args.preprocess_fit_sample_rows),
         "preprocess_tmp_dir": args.preprocess_tmp_dir,
         "config_paths": {
             "window": args.window_config,
