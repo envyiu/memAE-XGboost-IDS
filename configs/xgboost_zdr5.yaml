@@ -3,16 +3,16 @@ binary_detection:
   objective: binary:logistic
   eval_metric: aucpr
   tree_method: hist
-  n_estimators: 500
+  n_estimators: 1200           # baseline=1500, giảm nhẹ để train nhanh hơn
   early_stopping_rounds: 100
   learning_rate: 0.03
-  max_depth: 6
-  min_child_weight: 5
+  max_depth: 7                 # baseline=8, giảm nhẹ chống overfit
+  min_child_weight: 3          # baseline=2, tăng nhẹ
   subsample: 0.85
   colsample_bytree: 0.85
-  gamma: 0.3
-  reg_alpha: 0.01
-  reg_lambda: 2.0
+  gamma: 0.1                   # giữ nguyên baseline
+  reg_alpha: 0.001             # giữ gần baseline (0.0005)
+  reg_lambda: 1.2              # tăng nhẹ so với baseline (1.0)
   seed: 42
 training:
   max_train_samples: 600000
@@ -20,10 +20,7 @@ training:
   family_balance: true
   max_samples_per_attack_family: 80000
   benign_to_attack_ratio: 2.5
-  feature_selection: true
-  feature_selection_threshold: 0.0
-  feature_selection_repeats: 1
-  feature_selection_keep_memae_scalars: true
+  feature_selection: false     # tắt — chưa ổn định, dễ bỏ signal quan trọng
   min_eval_attack_samples: 50
   internal_eval_fraction: 0.2
 threshold:
