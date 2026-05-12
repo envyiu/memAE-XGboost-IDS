@@ -13,6 +13,17 @@ from sklearn.preprocessing import StandardScaler
 PreprocessDevice = Literal["cpu", "cuda", "auto"]
 
 
+def _is_no_clip_feature(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        lowered.startswith("ctx_")
+        or lowered.startswith("is_")
+        or "_is_" in lowered
+        or lowered.endswith("_indicator")
+        or "_indicator_" in lowered
+    )
+
+
 class IDSPreprocessor:
     def __init__(
         self,
@@ -24,6 +35,9 @@ class IDSPreprocessor:
         self.invalid_negative_columns = invalid_negative_columns or []
         self.invalid_negative_indices = [
             idx for idx, col in enumerate(self.feature_columns) if col in set(self.invalid_negative_columns)
+        ]
+        self.no_clip_indices = [
+            idx for idx, col in enumerate(self.feature_columns) if _is_no_clip_feature(col)
         ]
         self.clip_quantiles = clip_quantiles
         self.lower_bounds_: np.ndarray | None = None
@@ -68,6 +82,10 @@ class IDSPreprocessor:
         low_q, high_q = self.clip_quantiles
         self.lower_bounds_ = np.nanquantile(X, low_q, axis=0).astype(np.float32)
         self.upper_bounds_ = np.nanquantile(X, high_q, axis=0).astype(np.float32)
+        if self.no_clip_indices:
+            no_clip = np.asarray(self.no_clip_indices, dtype=np.int64)
+            self.lower_bounds_[no_clip] = -np.inf
+            self.upper_bounds_[no_clip] = np.inf
         X = np.clip(X, self.lower_bounds_, self.upper_bounds_)
         self.pipeline.fit(X.astype(np.float32, copy=False))
         self.fitted = True

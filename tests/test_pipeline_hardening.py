@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +12,9 @@ import torch
 
 from scripts.run_full_pipeline_all_families import (
     DEFAULT_FAMILIES,
+    _build_report_dir,
     _compact_candidate,
+    _memae_checkpoint_compatible,
     _select_primary_candidate,
     _summary_suffix,
 )
@@ -168,9 +171,59 @@ class PipelineHardeningTests(unittest.TestCase):
         self.assertEqual(selected["model_name"], "lower_zdr_good_fpr")
         self.assertEqual(selected["primary_selection_status"], "PASS")
 
+    def test_primary_candidate_does_not_select_by_zero_day_recall(self) -> None:
+        rows = [
+            {
+                "model_name": "zero_day_high_seen_low",
+                "target_fpr": 0.05,
+                "calibration_fpr": 0.05,
+                "validation": {"z_dr": 0.1, "fpr": 0.05},
+                "test_seen": {"z_dr": 0.1},
+                "test_zero_day": {"z_dr": 0.9, "fpr": 0.01, "f1": 0.1},
+            },
+            {
+                "model_name": "zero_day_low_seen_high",
+                "target_fpr": 0.02,
+                "calibration_fpr": 0.02,
+                "validation": {"z_dr": 0.8, "fpr": 0.02},
+                "test_seen": {"z_dr": 0.8},
+                "test_zero_day": {"z_dr": 0.2, "fpr": 0.01, "f1": 0.1},
+            },
+        ]
+        selected = _compact_candidate(_select_primary_candidate(rows, 0.05))
+        self.assertEqual(selected["model_name"], "zero_day_low_seen_high")
+
     def test_single_family_summary_suffix_is_not_generic(self) -> None:
         self.assertEqual(_summary_suffix("targetsel", "host", ["botnet"]), "botnet_host_targetsel")
         self.assertEqual(_summary_suffix("targetsel", "host", list(DEFAULT_FAMILIES)), "host_targetsel")
+
+    def test_report_dir_is_unique_per_run_and_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            created_at = datetime(2026, 5, 12, 9, 0, 0, tzinfo=timezone.utc)
+            first = _build_report_dir(tmp, "web_attack/host targetsel", created_at=created_at)
+            second = _build_report_dir(tmp, "web_attack/host targetsel", created_at=created_at)
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.exists())
+            self.assertTrue(second.exists())
+            self.assertIn("web_attack_host_targetsel", first.name)
+
+    def test_memae_checkpoint_compatibility_detects_input_dim_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous_cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                experiment = "tiny_exp"
+                processed_dir = Path("data/processed") / experiment
+                artifact_dir = Path("artifacts/memae/tiny_artifact")
+                processed_dir.mkdir(parents=True)
+                artifact_dir.mkdir(parents=True)
+                np.save(processed_dir / "X_train.npy", np.zeros((2, 3), dtype=np.float32))
+                torch.save({"input_dim": 4}, artifact_dir / "memae_best.pt")
+                self.assertFalse(_memae_checkpoint_compatible(experiment, artifact_dir / "memae_best.pt"))
+                torch.save({"input_dim": 3}, artifact_dir / "memae_best.pt")
+                self.assertTrue(_memae_checkpoint_compatible(experiment, artifact_dir / "memae_best.pt"))
+            finally:
+                os.chdir(previous_cwd)
 
     def test_preprocessor_auto_device_matches_cpu_transform(self) -> None:
         data = np.array(
@@ -187,6 +240,29 @@ class PipelineHardeningTests(unittest.TestCase):
         cpu = preprocessor.transform(data, device="cpu")
         auto = preprocessor.transform(data, device="auto", batch_rows=2)
         np.testing.assert_allclose(auto, cpu, rtol=1e-5, atol=1e-6)
+
+    def test_preprocessor_does_not_clip_context_indicators(self) -> None:
+        train = pd.DataFrame(
+            {
+                "ctx_dest_port_8080": [0.0] * 1000,
+                "rare_numeric": [0.0] * 1000,
+            }
+        )
+        test = pd.DataFrame(
+            {
+                "ctx_dest_port_8080": [1.0],
+                "rare_numeric": [1.0],
+            }
+        )
+        preprocessor = IDSPreprocessor(["ctx_dest_port_8080", "rare_numeric"])
+        preprocessor.fit(train)
+        transformed = preprocessor.transform(test, device="cpu")
+        self.assertTrue(np.isneginf(preprocessor.lower_bounds_[0]))
+        self.assertTrue(np.isposinf(preprocessor.upper_bounds_[0]))
+        self.assertEqual(preprocessor.lower_bounds_[1], 0.0)
+        self.assertEqual(preprocessor.upper_bounds_[1], 0.0)
+        self.assertEqual(transformed[0, 0], 1.0)
+        self.assertEqual(transformed[0, 1], 0.0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
     def test_preprocessor_cuda_transform_matches_cpu_transform(self) -> None:

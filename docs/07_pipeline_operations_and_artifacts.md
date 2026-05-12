@@ -157,7 +157,7 @@ zero_day_botnet_host_disjoint_zdr5_targetsel_zdr5_scorefusion
 
 ### 3.4 Summary suffix
 
-`_summary_suffix()` tạo tên summary trong `reports/run_{timestamp}`. Nếu chạy một family, prefix family được thêm vào để không ghi nhầm thành summary generic.
+`_summary_suffix()` tạo tên summary suffixed và cũng được dùng trong tên thư mục `reports/runs/{timestamp}_{suffix}`. Nếu chạy một family, prefix family được thêm vào để không ghi nhầm thành summary generic.
 
 Ví dụ test hiện có đảm bảo:
 
@@ -233,11 +233,9 @@ behavior proxies
 periodicity
 botnet context
 low-slow
-port diversity
-timing regularity
-destination concentration
-count windows: 10, 50, 200, 1000
-time windows: 60s, 300s, 600s, 3600s
+count windows: 50, 200, 1000
+time windows: 60s, 600s, 3600s
+watched_ports: 8080
 ```
 
 Nếu thay file này, cần chạy lại từ `preprocess` trở đi vì `X_*.npy`, MemAE checkpoint, `F_*.npy`, XGBoost, fusion đều phụ thuộc feature order.
@@ -249,10 +247,11 @@ Nếu thay file này, cần chạy lại từ `preprocess` trở đi vì `X_*.np
 ```text
 latent_dim=48
 memory_size=128
-hidden_dims=[128, 64]
-dropout=0.1
-epochs=80
+shrink_threshold=0.0078125
+epochs=65
 batch_size=4096
+entropy_weight=0.0002
+patience=10
 selection=seen_recall_at_benign_fpr @ 1% FPR
 ```
 
@@ -265,12 +264,20 @@ Nếu thay file này, cần chạy lại từ `memae` trở đi.
 ```text
 objective=binary:logistic
 eval_metric=aucpr
-n_estimators=1500
-early_stopping_rounds=100
-max_depth=8
+n_estimators=1200
+early_stopping_rounds=70
+learning_rate=0.04
+max_depth=7
+min_child_weight=2
+subsample=0.85
+colsample_bytree=0.85
+reg_alpha=0.0005
+reg_lambda=1.0
 family_balance=true
 max_train_samples=600000
 max_val_samples=150000
+max_samples_per_attack_family=80000
+benign_to_attack_ratio=2.5
 ```
 
 Nếu thay file này, cần chạy lại từ `xgboost` trở đi; fusion cũng cần train lại vì fusion dùng score XGBoost.
@@ -283,7 +290,7 @@ Script chỉ chạy stages nếu:
 
 ```text
 --force-retrain được bật
-hoặc artifact cần thiết chưa tồn tại
+hoặc artifact cần thiết chưa tồn tại / không tương thích
 ```
 
 Readiness helpers:
@@ -326,15 +333,28 @@ F_test_zero_day.npy
 memae_feature_schema.json
 ```
 
-### 7.3 Fusion model check
+### 7.3 Compatibility checks
 
-Ở đầu mỗi family:
+Pipeline không chỉ kiểm tra file tồn tại. Nó còn kiểm tra:
 
-```python
-fusion_model_check = artifacts/fusion/{fusion_artifact}/fusion_model.joblib
+```text
+MemAE checkpoint input_dim == data/processed/{experiment}/X_train.npy.shape[1]
+Feature schema D_value == processed input dim
+Feature schema include_raw_input == CLI --include-raw-input-features
+Feature schema raw_input_feature_patterns == CLI --raw-input-feature-pattern
 ```
 
-Nếu fusion model tồn tại và không `--force-retrain`, script bỏ qua toàn bộ training block và đi thẳng sang reports. Điều này tiết kiệm thời gian nhưng cũng có nghĩa nếu artifact cũ không khớp config mới, script không tự biết trừ khi tên suffix đổi hoặc force retrain.
+Nếu preprocess vừa chạy hoặc checkpoint/feature schema không tương thích, downstream sẽ tự chạy lại theo thứ tự MemAE → feature export → XGBoost → fusion nếu stage được phép. Nếu user bắt đầu quá muộn, ví dụ `--start-at features` nhưng MemAE checkpoint đã lệch input dim, script raise lỗi rõ và yêu cầu chạy từ `memae` hoặc sớm hơn.
+
+### 7.4 Fusion model check
+
+Fusion readiness yêu cầu:
+
+```text
+artifacts/fusion/{fusion_artifact}/fusion_model.joblib
+```
+
+Nếu feature hoặc XGBoost vừa chạy lại, fusion cũng bị coi là stale và train lại.
 
 ---
 
@@ -476,23 +496,19 @@ artifacts/fusion/{fusion_artifact}/val_score.npy
 ### 10.6 Reports
 
 ```text
-reports/metrics/
-  full_pipeline_all_families_summary.json
-  full_pipeline_all_families_summary.md
+reports/runs/{timestamp}_{suffix}/
+  full_pipeline_all_families_summary.json       # chỉ có khi chạy đủ DEFAULT_FAMILIES
+  full_pipeline_all_families_summary.md         # chỉ có khi chạy đủ DEFAULT_FAMILIES
+  full_pipeline_{suffix}_summary.json
+  full_pipeline_{suffix}_summary.md
   zero_day_{family}_.../
     detector_calibration_report_*.json
     detector_calibration_report_*.md
     fusion_calibration_report_*.json
     fusion_calibration_report_*.md
-
-reports/run_{timestamp}/
-  full_pipeline_{suffix}_summary.json
-  full_pipeline_{suffix}_summary.md
-  zero_day_{family}_.../
-    detector/fusion calibration reports copied for that run
 ```
 
-`reports/metrics` là vị trí stable/latest-ish cho all-family summary. `reports/run_*` là snapshot theo lần chạy.
+Mỗi lần chạy pipeline tạo một thư mục riêng dưới `reports/runs/`, vì vậy các report cũ được giữ nguyên và không còn khái niệm ghi đè stable/latest.
 
 ---
 
@@ -580,20 +596,7 @@ Chạy:
 
 ---
 
-## 13. Inconsistency cần lưu ý
-
-README hiện nhắc tới:
-
-```text
-scripts/audit_pipeline_artifacts.py
-scripts/generate_family_diagnostics.py
-```
-
-Trong cây file hiện tại được rà bằng `rg --files`, hai script này không xuất hiện. Tuy nhiên các report audit/diagnostics cũ vẫn có trong `reports/metrics`. Khi viết hướng dẫn vận hành mới, nên kiểm tra lại script có tồn tại trước khi yêu cầu chạy.
-
----
-
-## 14. Checklist vận hành benchmark
+## 13. Checklist vận hành benchmark
 
 1. Xác nhận raw data có trong `data/cicids2017`.
 2. Nếu thay cleaning/split/preprocess/window config, chạy lại từ stage tương ứng với `--force-retrain`.

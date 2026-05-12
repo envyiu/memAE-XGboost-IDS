@@ -199,7 +199,8 @@ IDS2/
 │   └── fusion/
 │
 └── reports/                          # Kết quả đánh giá
-    └── run_{timestamp}/              # Mỗi lần chạy tạo 1 thư mục riêng
+    └── runs/
+        └── {timestamp}_{suffix}/     # Mỗi lần chạy tạo 1 thư mục riêng
 ```
 
 ---
@@ -224,8 +225,10 @@ Mọi threshold đều được chọn dưới ràng buộc **FPR ≤ budget** (
 
 Pipeline tự động chọn **primary candidate** từ tất cả model/threshold combinations:
 1. Lọc candidate có `test_zero_day.fpr ≤ max_observed_test_fpr`
-2. Chọn candidate có Z-DR cao nhất
+2. Chọn candidate theo tín hiệu `test_seen` rồi `validation`, không dùng zero-day recall để tune
 3. Nếu không candidate nào pass → chọn candidate có FPR thấp nhất (đánh dấu `FAIL`)
+
+Điểm này cố ý bảo thủ: `test_zero_day` chỉ được dùng để kiểm tra FPR cap và báo cáo kết quả cuối, không dùng attack label zero-day để chọn model/threshold.
 
 ---
 

@@ -412,13 +412,13 @@ family
 Sau tất cả family, summary ghi:
 
 ```text
-reports/metrics/full_pipeline_all_families_summary.json
-reports/metrics/full_pipeline_all_families_summary.md
-reports/run_{timestamp}/full_pipeline_{suffix}_summary.json
-reports/run_{timestamp}/full_pipeline_{suffix}_summary.md
+reports/runs/{timestamp}_{suffix}/full_pipeline_all_families_summary.json
+reports/runs/{timestamp}_{suffix}/full_pipeline_all_families_summary.md
+reports/runs/{timestamp}_{suffix}/full_pipeline_{suffix}_summary.json
+reports/runs/{timestamp}_{suffix}/full_pipeline_{suffix}_summary.md
 ```
 
-Generic all-family summary chỉ ghi khi `families == DEFAULT_FAMILIES`. Nếu chạy một family, chỉ ghi summary trong thư mục run timestamp.
+Mỗi lần chạy tạo một thư mục riêng dưới `reports/runs/`, nên report cũ không bị ghi đè. Generic all-family summary chỉ ghi khi `families == DEFAULT_FAMILIES`. Nếu chạy một family, pipeline bỏ qua generic summary và chỉ ghi summary suffixed trong thư mục run đó.
 
 ---
 
@@ -458,8 +458,8 @@ Nếu không có passing, chọn row có `test_zero_day.fpr` thấp nhất và �
 Key:
 
 ```text
-1. zd_zdr
-2. cal_quality
+1. test_seen Z-DR/recall
+2. validation Z-DR/recall
 3. target_fpr
 4. model_priority
 5. -test_fpr
@@ -468,17 +468,14 @@ Key:
 Trong đó:
 
 ```text
-cal_quality = 1 - min(abs(cal_fpr - target_fpr) / target_fpr, 1)
 model_priority:
-  xgboost = 3
+  xgboost = 4
   memae = 3
   or_fusion = 2
   logistic_fusion = 1
 ```
 
-Ưu tiên đầu tiên là Z-DR thực tế trên zero-day miễn FPR cap pass. Nếu Z-DR bằng nhau, threshold bám target FPR tốt hơn được ưu tiên.
-
-Lưu ý: comment trong Markdown nói "maximizes seen-validation recall" nhưng implementation hiện tại ưu tiên `test_zero_day.z_dr`. Khi diễn giải kết quả, nên tin implementation trong `_candidate_selection_key()`.
+Selection không dùng `test_zero_day.z_dr` vì đó là attack label của family zero-day. `test_zero_day.fpr` chỉ dùng như gate/cap và tie-break cuối cùng theo hướng FPR thấp hơn. Hệ quả thực tế: nếu `val` hoặc `test_seen` gần như không có seen attack, primary có thể không phải candidate có F1 cao nhất trên `test_zero_day`; khi debug nên đọc toàn bộ `candidate_rows`.
 
 ---
 

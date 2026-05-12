@@ -19,7 +19,7 @@ clean parquet
   -> X_*.npy
 ```
 
-Điểm quan trọng là window features vẫn đi qua cùng bước clipping, median impute và standardize như feature số gốc. Vì vậy giá trị raw như `win_bytes_sum_1000` có thể rất lớn nhưng khi đến model đã được chuẩn hóa.
+Điểm quan trọng là window features vẫn đi qua `IDSPreprocessor`: median impute và standardize như feature số gốc. Continuous window features vẫn bị quantile-clip theo train split; riêng context/indicator features như `ctx_*`, `*_indicator*`, `is_*` không bị clip để không làm mất tín hiệu binary hiếm.
 
 Trong config chính:
 
@@ -28,8 +28,8 @@ enabled: true
 window_scope: full_source_file
 group_by: [source_file, source_ip]
 order_by: [timestamp, row_id]
-window_sizes: [10, 50, 200, 1000]
-time_window_seconds: [60, 300, 600, 3600]
+window_sizes: [50, 200, 1000]
+time_window_seconds: [60, 600, 3600]
 ```
 
 Nghĩa là mỗi source host trong từng file gốc có một chuỗi flow riêng, được sắp theo thời gian rồi theo `row_id`, sau đó tính thống kê quá khứ/tới hiện tại trong cửa sổ theo số flow và theo giây.
@@ -163,7 +163,7 @@ Những feature này giúp model biết cổng đang xét thuộc lớp dịch v
 
 ## 6. Count-based window features
 
-Count-based window dùng `window_sizes`, ví dụ `[10, 50, 200, 1000]`. Với mỗi flow thứ `i` trong group, window `W` gồm tối đa `W` flow gần nhất tính cả flow hiện tại.
+Count-based window dùng `window_sizes`, ví dụ `[50, 200, 1000]`. Với mỗi flow thứ `i` trong group, window `W` gồm tối đa `W` flow gần nhất tính cả flow hiện tại.
 
 ### 6.1 Flow count
 
@@ -327,7 +327,7 @@ port_per_dest_ip = unique_ports / unique_dest_ips
 
 ## 7. Time-based window features
 
-Time-based window dùng `time_window_seconds`, ví dụ `[60, 300, 600, 3600]`. Với mỗi flow hiện tại, window gồm tất cả flow cùng group có timestamp nằm trong khoảng:
+Time-based window dùng `time_window_seconds`, ví dụ `[60, 600, 3600]`. Với mỗi flow hiện tại, window gồm tất cả flow cùng group có timestamp nằm trong khoảng:
 
 ```text
 times[current] - times[old] <= seconds

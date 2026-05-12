@@ -251,6 +251,11 @@ def preprocess_experiment(
         "imputation": "median",
         "invalid_negative_columns": invalid_negative_columns,
         "clip_quantiles": [0.001, 0.999],
+        "no_clip_feature_patterns": ["ctx_*", "is_*", "*_is_*", "*_indicator", "*_indicator_*"],
+        "no_clip_features": [
+            final_feature_columns[idx]
+            for idx in getattr(preprocessor, "no_clip_indices", [])
+        ],
         "clip_fit_scope": "train split only",
         "fit_scope": "train split only",
         "fit_sample_rows": int(min(fit_sample_rows, train_total)),

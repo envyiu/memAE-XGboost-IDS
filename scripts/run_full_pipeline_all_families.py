@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -117,6 +118,24 @@ def _summary_suffix(
     return base
 
 
+def _safe_path_token(value: str) -> str:
+    token = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in value.strip())
+    return token.strip("_") or "run"
+
+
+def _build_report_dir(report_root: str | Path, summary_suffix: str, created_at: datetime | None = None) -> Path:
+    created_at = created_at or datetime.now(timezone.utc)
+    timestamp = created_at.strftime("%Y%m%dT%H%M%S%fZ")
+    base_name = f"{timestamp}_{_safe_path_token(summary_suffix)}"
+    root = Path(report_root)
+    for idx in range(1000):
+        run_name = base_name if idx == 0 else f"{base_name}_{idx:03d}"
+        run_dir = root / run_name
+        if not run_dir.exists():
+            return ensure_dir(run_dir)
+    raise RuntimeError(f"Cannot create a unique report directory under {root}")
+
+
 def _stage_allowed(stage: str, start_at: str, stop_after: str) -> bool:
     stage_idx = STAGES.index(stage)
     return STAGES.index(start_at) <= stage_idx <= STAGES.index(stop_after)
@@ -154,27 +173,20 @@ def _candidate_rows(detector: dict, fusion: dict) -> list[dict]:
 
 def _model_priority(model_name: str) -> int:
     return {
-        "xgboost": 3,
+        "xgboost": 4,
         "memae": 3,
         "or_fusion": 2,
         "logistic_fusion": 1,
     }.get(model_name, 0)
 
 
-def _candidate_selection_key(row: dict) -> tuple:
+def _candidate_selection_key(row: dict) -> tuple[float, float, float, int, float]:
     test_seen = row.get("test_seen", {})
     validation = row.get("validation", {})
     test = row.get("test_zero_day", {})
-    
-    seen_zdr = float(test_seen.get("z_dr", test_seen.get("recall", 0.0)))
-    zd_zdr = float(test.get("z_dr", 0.0))
-    cal_fpr = float(row.get("calibration_fpr", row.get("validation_fpr", 0.0)))
-    target_fpr = float(row.get("target_fpr", 0.05))
-    cal_quality = 1.0 - min(abs(cal_fpr - target_fpr) / max(target_fpr, 1e-6), 1.0)
-    
     return (
-        zd_zdr,  # Prioritize actual zero-day performance for benchmark reporting
-        cal_quality,
+        float(test_seen.get("z_dr", test_seen.get("recall", 0.0))),
+        float(validation.get("z_dr", validation.get("recall", 0.0))),
         float(row.get("target_fpr", 0.0)),
         _model_priority(str(row.get("model_name", ""))),
         -float(test.get("fpr", 1.0)),
@@ -285,6 +297,27 @@ def _processed_ready(experiment: str) -> bool:
     )
 
 
+def _processed_input_dim(experiment: str) -> int | None:
+    path = Path("data/processed") / experiment / "X_train.npy"
+    if not path.exists():
+        return None
+    return int(np.load(path, mmap_mode="r").shape[1])
+
+
+def _memae_checkpoint_input_dim(path: str | Path) -> int | None:
+    path = Path(path)
+    if not path.exists():
+        return None
+    checkpoint = torch.load(path, map_location="cpu")
+    return int(checkpoint.get("input_dim", -1))
+
+
+def _memae_checkpoint_compatible(experiment: str, checkpoint_path: str | Path) -> bool:
+    processed_dim = _processed_input_dim(experiment)
+    checkpoint_dim = _memae_checkpoint_input_dim(checkpoint_path)
+    return processed_dim is not None and checkpoint_dim == processed_dim
+
+
 def _features_ready(feature_set: str) -> bool:
     feature_dir = Path("data/features") / feature_set
     return all(
@@ -296,6 +329,27 @@ def _features_ready(feature_set: str) -> bool:
             "F_test_zero_day.npy",
             "memae_feature_schema.json",
         )
+    )
+
+
+def _features_compatible(
+    experiment: str,
+    feature_set: str,
+    include_raw_input: bool,
+    raw_input_feature_patterns: list[str] | None,
+) -> bool:
+    feature_dir = Path("data/features") / feature_set
+    schema_path = feature_dir / "memae_feature_schema.json"
+    if not _features_ready(feature_set) or not schema_path.exists():
+        return False
+    schema = read_json(schema_path)
+    processed_dim = _processed_input_dim(experiment)
+    expected_raw_patterns = list(raw_input_feature_patterns or [])
+    return (
+        processed_dim is not None
+        and int(schema.get("D_value", -1)) == processed_dim
+        and bool(schema.get("include_raw_input", False)) == bool(include_raw_input)
+        and list(schema.get("raw_input_feature_patterns", [])) == expected_raw_patterns
     )
 
 
@@ -422,6 +476,11 @@ def main() -> None:
     )
     parser.add_argument("--start-at", choices=STAGES, default="split")
     parser.add_argument("--stop-after", choices=STAGES, default="reports")
+    parser.add_argument(
+        "--report-root",
+        default="reports/runs",
+        help="Root directory for per-run report folders. Each run creates one timestamped child directory.",
+    )
     parser.add_argument("--allow-low-support", action="store_true")
     parser.add_argument("--force-retrain", action="store_true")
     parser.add_argument("--clean-data", action="store_true", help="Wipe all intermediate data to free up space")
@@ -461,17 +520,41 @@ def main() -> None:
     fpr_budgets = _parse_fpr_budgets(args.fpr_budgets)
     group_columns = SPLIT_GROUP_COLUMNS[args.split_group_mode]
     summary_results = []
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = ensure_dir(Path("reports") / f"run_{run_timestamp}")
+    summary_suffix = _summary_suffix(args.variant_suffix, args.experiment_suffix, families)
+    report_dir = (
+        _build_report_dir(args.report_root, summary_suffix)
+        if _stage_allowed("reports", args.start_at, args.stop_after)
+        else None
+    )
 
     for family in families:
         experiment = _experiment_name(family, args.experiment_suffix)
         split_dir = Path("data/splits") / experiment
         feature_set = f"{experiment}_{args.variant_suffix}"
         fusion_artifact = f"{feature_set}_{args.fusion_suffix}"
+        memae_checkpoint = Path("artifacts/memae") / feature_set / "memae_best.pt"
+        xgboost_model = Path("artifacts/xgboost") / feature_set / "xgboost_model.json"
         fusion_model_check = Path("artifacts/fusion") / fusion_artifact / "fusion_model.joblib"
+        pipeline_ready = (
+            (split_dir / "split_manifest.json").exists()
+            and _processed_ready(experiment)
+            and _memae_checkpoint_compatible(experiment, memae_checkpoint)
+            and _features_compatible(
+                experiment,
+                feature_set,
+                include_raw_input=args.include_raw_input_features,
+                raw_input_feature_patterns=args.raw_input_feature_pattern,
+            )
+            and xgboost_model.exists()
+            and fusion_model_check.exists()
+        )
 
-        if args.force_retrain or not fusion_model_check.exists():
+        if args.force_retrain or not pipeline_ready:
+            preprocess_ran = False
+            memae_ran = False
+            features_ran = False
+            xgboost_ran = False
+
             if _stage_allowed("split", args.start_at, args.stop_after) and (
                 args.force_retrain or not (split_dir / "split_manifest.json").exists()
             ):
@@ -502,20 +585,41 @@ def main() -> None:
                     preprocess_batch_rows=args.preprocess_batch_rows,
                     preprocess_tmp_dir=args.preprocess_tmp_dir,
                 )
+                preprocess_ran = True
             else:
                 print(f"[skip] {family}: preprocess")
 
-            memae_checkpoint = Path("artifacts/memae") / feature_set / "memae_best.pt"
+            memae_needs_rerun = (
+                args.force_retrain
+                or preprocess_ran
+                or not _memae_checkpoint_compatible(experiment, memae_checkpoint)
+            )
             if _stage_allowed("memae", args.start_at, args.stop_after) and (
-                args.force_retrain or not memae_checkpoint.exists()
+                memae_needs_rerun
             ):
                 print(f"[run] {family}: train memae")
                 train_memae(experiment, memae_config, seed=args.seed, artifact_name=feature_set)
+                memae_ran = True
             else:
+                if memae_needs_rerun and _stage_allowed("features", args.start_at, args.stop_after):
+                    raise ValueError(
+                        f"{family}: MemAE checkpoint is incompatible with current processed data. "
+                        "Rerun with --start-at memae or earlier."
+                    )
                 print(f"[skip] {family}: train memae")
 
+            features_need_rerun = (
+                args.force_retrain
+                or memae_ran
+                or not _features_compatible(
+                    experiment,
+                    feature_set,
+                    include_raw_input=args.include_raw_input_features,
+                    raw_input_feature_patterns=args.raw_input_feature_pattern,
+                )
+            )
             if _stage_allowed("features", args.start_at, args.stop_after) and (
-                args.force_retrain or not _features_ready(feature_set)
+                features_need_rerun
             ):
                 print(f"[run] {family}: export memae features")
                 export_features(
@@ -529,30 +633,50 @@ def main() -> None:
                     amp=args.memae_export_amp,
                     num_workers=args.memae_export_num_workers,
                 )
+                features_ran = True
             else:
+                if features_need_rerun and _stage_allowed("xgboost", args.start_at, args.stop_after):
+                    raise ValueError(
+                        f"{family}: MemAE feature files are missing or incompatible. "
+                        "Rerun with --start-at features or earlier."
+                    )
                 print(f"[skip] {family}: export memae features")
 
-            xgboost_model = Path("artifacts/xgboost") / feature_set / "xgboost_model.json"
+            xgboost_needs_rerun = args.force_retrain or features_ran or not xgboost_model.exists()
             if _stage_allowed("xgboost", args.start_at, args.stop_after) and (
-                args.force_retrain or not xgboost_model.exists()
+                xgboost_needs_rerun
             ):
                 print(f"[run] {family}: train xgboost")
                 train_xgboost_feature_set(experiment, feature_set, xgboost_config, seed=args.seed)
+                xgboost_ran = True
             else:
+                if xgboost_needs_rerun and _stage_allowed("fusion", args.start_at, args.stop_after):
+                    raise ValueError(
+                        f"{family}: XGBoost artifact is missing or stale. "
+                        "Rerun with --start-at xgboost or earlier."
+                    )
                 print(f"[skip] {family}: train xgboost")
 
             fusion_model = Path("artifacts/fusion") / fusion_artifact / "fusion_model.joblib"
+            fusion_needs_rerun = args.force_retrain or xgboost_ran or features_ran or not fusion_model.exists()
             if _stage_allowed("fusion", args.start_at, args.stop_after) and (
-                args.force_retrain or not fusion_model.exists()
+                fusion_needs_rerun
             ):
                 print(f"[run] {family}: train fusion")
                 train_score_fusion(experiment, feature_set, feature_set, fusion_artifact)
             else:
+                if fusion_needs_rerun and _stage_allowed("reports", args.start_at, args.stop_after):
+                    raise ValueError(
+                        f"{family}: fusion artifact is missing or stale. "
+                        "Rerun with --start-at fusion or earlier."
+                    )
                 print(f"[skip] {family}: train fusion")
 
         if not _stage_allowed("reports", args.start_at, args.stop_after):
             continue
 
+        if report_dir is None:
+            raise RuntimeError("Internal error: report directory was not initialized")
         print(f"[run] {family}: reports")
         family_summary = _summarize_family(
             experiment,
@@ -561,12 +685,11 @@ def main() -> None:
             calibration_mode=args.calibration_mode,
             fpr_budgets=fpr_budgets,
             max_observed_test_fpr=args.max_observed_test_fpr,
-            report_dir=run_dir,
+            report_dir=report_dir,
         )
         family_summary["family"] = family
         summary_results.append(family_summary)
 
-    report_dir = ensure_dir(Path("reports/metrics"))
     if not summary_results:
         print(f"No reports generated because --stop-after={args.stop_after}")
         return
@@ -597,6 +720,7 @@ def main() -> None:
         "preprocess_batch_rows": int(args.preprocess_batch_rows),
         "preprocess_fit_sample_rows": int(args.preprocess_fit_sample_rows),
         "preprocess_tmp_dir": args.preprocess_tmp_dir,
+        "report_dir": str(report_dir),
         "config_paths": {
             "window": args.window_config,
             "memae": args.memae_config,
@@ -629,13 +753,12 @@ def main() -> None:
     else:
         json_path = None
         md_path = None
-    summary_suffix = _summary_suffix(args.variant_suffix, args.experiment_suffix, families)
-    suffixed_json_path = run_dir / f"full_pipeline_{summary_suffix}_summary.json"
-    suffixed_md_path = run_dir / f"full_pipeline_{summary_suffix}_summary.md"
+    suffixed_json_path = report_dir / f"full_pipeline_{summary_suffix}_summary.json"
+    suffixed_md_path = report_dir / f"full_pipeline_{summary_suffix}_summary.md"
     write_json(suffixed_json_path, payload)
     _write_markdown(suffixed_md_path, payload)
-    
-    print(f"\nAll reports generated in: {run_dir}")
+
+    print(f"\nReports generated in: {report_dir}")
     print(f"Summary written to: {suffixed_json_path}")
     print("\nBenchmark Z-DR (1% FPR constraint):")
     for row in summary_results:

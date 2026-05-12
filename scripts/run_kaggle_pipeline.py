@@ -82,7 +82,7 @@ def main() -> None:
         "--memae-export-data-parallel",
         "--memae-export-amp",
         "--memae-export-num-workers",
-        "2",
+        "0",
         *extra,
     ]
     if args.force_retrain:

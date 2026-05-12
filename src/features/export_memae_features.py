@@ -5,7 +5,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 from numpy.lib.format import open_memmap
 
 from src.models.memae.model import MemAE
@@ -65,18 +64,15 @@ def _extract_to_memmap(
     pin_memory: bool = False,
     use_amp: bool = False,
 ) -> list[int]:
-    loader = DataLoader(
-        TensorDataset(torch.from_numpy(np.asarray(X, dtype=np.float32))),
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
-    )
+    if num_workers:
+        raise ValueError("export_features currently requires num_workers=0 for memmap-safe batch loading")
     out = open_memmap(output_path, mode="w+", dtype="float32", shape=(len(X), feature_dim))
     offset = 0
     model.eval()
     with torch.no_grad():
-        for (batch,) in loader:
+        for start in range(0, len(X), batch_size):
+            batch_np = np.asarray(X[start : start + batch_size], dtype=np.float32).copy()
+            batch = torch.from_numpy(batch_np)
             batch = batch.to(device, non_blocking=pin_memory)
             with _cuda_autocast(use_amp and device.type == "cuda"):
                 features_t = _batch_features(model, batch)
@@ -114,6 +110,13 @@ def export_features(
     processed_dir = Path("data/processed") / experiment
     feature_dir = ensure_dir(Path("data/features") / (feature_set or experiment))
     checkpoint = torch.load(Path("artifacts/memae") / (artifact_name or experiment) / "memae_best.pt", map_location="cpu")
+    processed_shape = np.load(processed_dir / "X_train.npy", mmap_mode="r").shape
+    if int(checkpoint["input_dim"]) != int(processed_shape[1]):
+        raise ValueError(
+            "MemAE checkpoint input_dim does not match current processed data: "
+            f"checkpoint input_dim={int(checkpoint['input_dim'])}, X_train columns={int(processed_shape[1])}. "
+            "Rerun MemAE training for this experiment/artifact before exporting features."
+        )
     model = MemAE(checkpoint["input_dim"], **checkpoint["model_config"])
     model.load_state_dict(checkpoint["model_state_dict"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

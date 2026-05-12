@@ -196,9 +196,23 @@ def fit(self, data):
     X = self._sanitize(data)
     self.lower_bounds_ = np.nanquantile(X, 0.001, axis=0)  # clip bottom 0.1%
     self.upper_bounds_ = np.nanquantile(X, 0.999, axis=0)  # clip top 0.1%
+    self.lower_bounds_[no_clip_indices] = -np.inf
+    self.upper_bounds_[no_clip_indices] = np.inf
     X = np.clip(X, self.lower_bounds_, self.upper_bounds_)
     self.pipeline.fit(X)  # fit median imputer + standard scaler
 ```
+
+`no_clip_indices` là các feature context/indicator theo tên:
+
+```text
+ctx_*
+is_*
+*_is_*
+*_indicator
+*_indicator_*
+```
+
+Các cột này thường là binary `0/1`. Không quantile-clip chúng vì nếu giá trị `1` hiếm trong train, percentile 99.9% có thể vẫn là `0`, làm mất tín hiệu zero-day ở test. Continuous numeric features vẫn được clip như cũ để giảm outlier.
 
 **Transform:**
 ```python
@@ -294,7 +308,7 @@ data/processed/{experiment}/
 ├── row_id_val.npy
 ├── row_id_test_seen.npy
 ├── row_id_test_zero_day.npy
-└── feature_schema.json # Metadata: feature_order, scaler_type, window config
+└── feature_schema.json # Metadata: feature_order, scaler_type, window config, no_clip_features
 ```
 
 ### 4.5 Preprocessor fit sampling
@@ -307,4 +321,4 @@ sample_ratio = min(1.0, fit_sample_rows / train_total)
 # → tổng ~400K rows dùng fit preprocessor
 ```
 
-Đây là **stratified random** trên mỗi source file chunk, đảm bảo mọi source đều đóng góp.
+Đây là random sampling theo từng `source_file` chunk, không phải stratified theo label. Cách này giữ mức RAM thấp và giúp nhiều source file cùng đóng góp vào fit sample.

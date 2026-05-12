@@ -259,7 +259,7 @@ evals_result
 
 ### 8.2 `feature_selection.json`
 
-Khi `training.feature_selection=true`, training fit model ban đầu, tính permutation importance trên eval split hiệu lực, bỏ các feature có importance `<= feature_selection_threshold`, rồi retrain model cuối trên feature đã chọn. Config chính dùng `feature_selection_repeats=1` để giữ runtime hợp lý trên feature-set lớn. Các MemAE scalar nền như `re_scalar`, `attn_entropy`, `attn_sparsity`, `attn_max` được giữ mặc định vì đây là anomaly signal có thể hữu ích cho zero-day dù không nổi bật trên seen-family validation. Metadata lưu:
+Khi `training.feature_selection=true`, training fit model ban đầu, tính permutation importance trên eval split hiệu lực, bỏ các feature có importance `<= feature_selection_threshold`, rồi retrain model cuối trên feature đã chọn. Recipe `zdr5` chính hiện tắt feature selection để giữ kết quả ổn định và tránh bỏ nhầm tín hiệu zero-day; logic này chỉ là tùy chọn thử nghiệm. Các MemAE scalar nền như `re_scalar`, `attn_entropy`, `attn_sparsity`, `attn_max` được giữ mặc định nếu feature selection được bật. Metadata lưu:
 
 ```text
 selected_indices
@@ -421,7 +421,7 @@ logistic_fusion
 
 Vì vậy XGBoost và MemAE vẫn được đánh giá độc lập. Logistic fusion là một candidate bổ sung, không thay thế các detector gốc.
 
-Pipeline summary chọn primary candidate từ tất cả candidate theo ràng buộc FPR cap. Do đó một family có thể chọn XGBoost, family khác chọn MemAE hoặc fusion.
+Pipeline summary chọn primary candidate từ tất cả candidate theo ràng buộc FPR cap, nhưng selection không tune theo zero-day recall. Do đó một family có thể chọn XGBoost, family khác chọn MemAE hoặc fusion; khi `val/test_seen` thiếu attack signal, cần đọc thêm candidate table vì primary không nhất thiết là candidate có F1 cao nhất trên `test_zero_day`.
 
 ---
 

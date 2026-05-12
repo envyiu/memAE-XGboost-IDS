@@ -82,8 +82,6 @@ model:
   latent_dim: 48
   memory_size: 128
   shrink_threshold: 0.0078125
-  hidden_dims: [128, 64]
-  dropout: 0.1
 ```
 
 ### 2.1 Encoder
@@ -92,15 +90,10 @@ Encoder là MLP:
 
 ```text
 input_dim
-  -> Linear(input_dim, 128)
+  -> Linear(input_dim, hidden)
   -> BatchNorm1d
   -> ReLU
-  -> Dropout(0.1)
-  -> Linear(128, 64)
-  -> BatchNorm1d
-  -> ReLU
-  -> Dropout(0.1)
-  -> Linear(64, latent_dim)
+  -> Linear(hidden, latent_dim)
 ```
 
 Nếu `hidden_dims` không truyền vào, model dùng một hidden layer:
@@ -109,7 +102,7 @@ Nếu `hidden_dims` không truyền vào, model dùng một hidden layer:
 hidden = max(64, min(256, input_dim * 2))
 ```
 
-Trong recipe hiện tại hidden dims được khai báo rõ nên không dùng fallback này.
+Trong recipe chính hiện tại không khai báo `hidden_dims`, nên dùng fallback một hidden layer này.
 
 ### 2.2 Memory bank
 
@@ -156,19 +149,14 @@ Nếu `shrink_threshold <= 0`, hàm trả attention gốc.
 
 ### 2.4 Decoder
 
-Decoder đảo chiều `hidden_dims`:
+Decoder đảo chiều hidden layer:
 
 ```text
 latent_dim
-  -> Linear(48, 64)
+  -> Linear(48, hidden)
   -> BatchNorm1d
   -> ReLU
-  -> Dropout(0.1)
-  -> Linear(64, 128)
-  -> BatchNorm1d
-  -> ReLU
-  -> Dropout(0.1)
-  -> Linear(128, input_dim)
+  -> Linear(hidden, input_dim)
 ```
 
 Forward trả về:
@@ -436,14 +424,18 @@ open_memmap(output_path, mode="w+", dtype="float32", shape=(len(X), feature_dim)
 
 Mỗi batch:
 
-1. Chạy model trên device.
-2. Tạo feature tensor.
-3. Nếu cần, concatenate raw input.
-4. Assert toàn bộ finite.
-5. Assert số cột đúng `feature_dim`.
-6. Ghi vào memmap theo offset.
+1. Slice trực tiếp từ `X` memmap.
+2. Copy batch sang writable `float32` NumPy array.
+3. Chạy model trên device.
+4. Tạo feature tensor.
+5. Nếu cần, concatenate raw input.
+6. Assert toàn bộ finite.
+7. Assert số cột đúng `feature_dim`.
+8. Ghi vào memmap theo offset.
 
 Do output là `.npy` memmap chuẩn, các bước sau có thể `np.load(..., mmap_mode="r")` mà không load toàn bộ vào RAM.
+
+Export hiện yêu cầu `num_workers=0`. Đây là lựa chọn cố ý để tránh DataLoader worker giữ reference tới memmap read-only và gây warning/hành vi khó đoán trên dataset lớn.
 
 ### 5.4 Schema export
 
