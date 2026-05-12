@@ -4,16 +4,16 @@ binary_detection:
   eval_metric: aucpr
   tree_method: hist
   device: cuda
-  n_estimators: 500
+  n_estimators: 1200
   early_stopping_rounds: 100
   learning_rate: 0.03
-  max_depth: 6
-  min_child_weight: 5
+  max_depth: 7
+  min_child_weight: 3
   subsample: 0.85
   colsample_bytree: 0.85
-  gamma: 0.3
+  gamma: 0.1
   reg_alpha: 0.01
-  reg_lambda: 2.0
+  reg_lambda: 1.2
   seed: 42
 training:
   max_train_samples: 1200000
