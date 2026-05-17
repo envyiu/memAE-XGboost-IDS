@@ -65,6 +65,22 @@ def _value_counts(values: np.ndarray | None) -> dict[str, int]:
     return {str(key): int(count) for key, count in zip(unique, counts, strict=False)}
 
 
+def _qualified_attack_family_counts(
+    family: np.ndarray | None,
+    y: np.ndarray,
+    min_samples_per_family: int,
+) -> dict[str, int]:
+    if family is None:
+        return {}
+    attack_family = family[np.asarray(y) == 1]
+    counts = _value_counts(attack_family)
+    return {
+        name: count
+        for name, count in counts.items()
+        if name != "benign" and count >= min_samples_per_family
+    }
+
+
 def _select_features(
     model: xgb.XGBClassifier,
     X_val: np.ndarray,
@@ -122,6 +138,16 @@ def _memae_protected_feature_indices(feature_schema: dict, train_cfg: dict) -> n
     return np.asarray([idx for idx in protected if 0 <= idx < memae_dim], dtype=np.int64)
 
 
+def _validation_split_name(feature_dir: Path, processed_dir: Path) -> str:
+    if (
+        (feature_dir / "F_model_selection_val.npy").exists()
+        and (processed_dir / "y_model_selection_val.npy").exists()
+        and (processed_dir / "family_model_selection_val.npy").exists()
+    ):
+        return "model_selection_val"
+    return "val"
+
+
 def train_xgboost_feature_set(
     experiment: str,
     feature_set: str,
@@ -132,14 +158,17 @@ def train_xgboost_feature_set(
     feature_dir = Path("data/features") / feature_set
     processed_dir = Path("data/processed") / experiment
     artifact_dir = ensure_dir(Path("artifacts/xgboost") / feature_set)
+    validation_split = _validation_split_name(feature_dir, processed_dir)
 
     F_train = np.load(feature_dir / "F_train.npy", mmap_mode="r")
-    F_val = np.load(feature_dir / "F_val.npy", mmap_mode="r")
+    F_val = np.load(feature_dir / f"F_{validation_split}.npy", mmap_mode="r")
     y_train = np.load(processed_dir / "y_train.npy")
-    y_val = np.load(processed_dir / "y_val.npy")
+    y_val = np.load(processed_dir / f"y_{validation_split}.npy")
 
     train_cfg = config.get("training", {})
     family_train = np.load(processed_dir / "family_train.npy", allow_pickle=True) if (processed_dir / "family_train.npy").exists() else None
+    family_val_path = processed_dir / f"family_{validation_split}.npy"
+    family_val = np.load(family_val_path, allow_pickle=True) if family_val_path.exists() else None
     F_train_sample, y_train_sample, train_idx = _sample_xy(
         F_train,
         y_train,
@@ -148,16 +177,39 @@ def train_xgboost_feature_set(
         family_arr=family_train,
         cfg=train_cfg,
     )
-    F_val_sample, y_val_sample, _ = _sample_xy(F_val, y_val, train_cfg.get("max_val_samples"), seed + 1)
+    F_val_sample, y_val_sample, val_idx = _sample_xy(F_val, y_val, train_cfg.get("max_val_samples"), seed + 1)
     family_train_sample = family_train[train_idx] if family_train is not None and train_idx is not None else family_train
+    family_val_sample = family_val[val_idx] if family_val is not None and val_idx is not None else family_val
     eval_positive_count = int((y_val_sample == 1).sum())
     min_eval_positive = int(train_cfg.get("min_eval_attack_samples", 50))
-    eval_source = "official_val"
+    min_eval_attack_families = int(train_cfg.get("min_eval_attack_families", 2))
+    min_eval_samples_per_family = int(train_cfg.get("min_eval_samples_per_attack_family", 10))
+    qualified_eval_families = _qualified_attack_family_counts(
+        family_val_sample,
+        y_val_sample,
+        min_eval_samples_per_family,
+    )
+    eval_source = validation_split
+    eval_fallback_reason = None
     F_fit = F_train_sample
     y_fit = y_train_sample
     F_eval = F_val_sample
     y_eval = y_val_sample
-    if eval_positive_count < min_eval_positive and int((y_train_sample == 1).sum()) >= 2:
+    use_internal_eval = bool(train_cfg.get("always_use_internal_eval", False))
+    if eval_positive_count < min_eval_positive:
+        use_internal_eval = True
+        eval_fallback_reason = (
+            f"{validation_split} has {eval_positive_count} positive samples (< {min_eval_positive})"
+        )
+    elif family_val_sample is not None and len(qualified_eval_families) < min_eval_attack_families:
+        use_internal_eval = True
+        eval_fallback_reason = (
+            f"{validation_split} has only "
+            f"{len(qualified_eval_families)} attack families with >= {min_eval_samples_per_family} samples "
+            f"(< {min_eval_attack_families})"
+        )
+
+    if use_internal_eval and int((y_train_sample == 1).sum()) >= 2:
         eval_fraction = float(train_cfg.get("internal_eval_fraction", 0.2))
         F_fit, F_eval, y_fit, y_eval = train_test_split(
             F_train_sample,
@@ -168,9 +220,8 @@ def train_xgboost_feature_set(
         )
         eval_source = "train_stratified_holdout"
         logger.warning(
-            "Using train stratified holdout for XGBoost eval: official val has %d positive samples (< %d).",
-            eval_positive_count,
-            min_eval_positive,
+            "Using train stratified holdout for XGBoost eval: %s.",
+            eval_fallback_reason or "always_use_internal_eval=true",
         )
     neg = int((y_fit == 0).sum())
     pos = int((y_fit == 1).sum())
@@ -241,6 +292,8 @@ def train_xgboost_feature_set(
     log = {
         "experiment": experiment,
         "feature_set": feature_set,
+        "train_split": "train",
+        "validation_split": validation_split,
         "feature_dims": int(F_train.shape[1]),
         "model_feature_dims": int(feature_selection_metadata["selected_feature_count"]),
         "feature_schema": feature_schema,
@@ -249,7 +302,11 @@ def train_xgboost_feature_set(
         "val_samples_used": int(len(y_val_sample)),
         "eval_samples_used": int(len(y_eval)),
         "eval_source": eval_source,
+        "eval_fallback_reason": eval_fallback_reason,
+        "validation_positive_samples": eval_positive_count,
+        "validation_qualified_attack_family_counts": qualified_eval_families,
         "official_val_positive_samples": eval_positive_count,
+        "official_val_qualified_attack_family_counts": qualified_eval_families,
         "eval_positive_samples": int((y_eval == 1).sum()),
         "class_counts_train": {"benign": int((y_train_sample == 0).sum()), "malicious": int((y_train_sample == 1).sum())},
         "class_counts_fit": {"benign": neg, "malicious": pos},

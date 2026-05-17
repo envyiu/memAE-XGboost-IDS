@@ -5,30 +5,62 @@ from torch import nn
 import torch.nn.functional as F
 
 
+class _BatchNorm1dAllowSingle(nn.BatchNorm1d):
+    """BatchNorm1d variant that keeps train-mode singleton batches valid."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.training and input.dim() == 2 and input.shape[0] == 1:
+            return F.batch_norm(
+                input,
+                self.running_mean,
+                self.running_var,
+                self.weight,
+                self.bias,
+                training=False,
+                momentum=0.0,
+                eps=self.eps,
+            )
+        return super().forward(input)
+
+
 class MemAE(nn.Module):
-    def __init__(self, input_dim: int, latent_dim: int = 32, memory_size: int = 64, shrink_threshold: float = 0.0025, hidden_dims: list[int] = None, dropout: float = 0.0):
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int = 32,
+        memory_size: int = 64,
+        shrink_threshold: float = 0.0025,
+        hidden_dims: list[int] | None = None,
+        dropout: float = 0.0,
+    ):
         super().__init__()
+        if input_dim <= 0:
+            raise ValueError("input_dim must be > 0")
+        if latent_dim <= 0:
+            raise ValueError("latent_dim must be > 0")
+        if memory_size <= 0:
+            raise ValueError("memory_size must be > 0")
         self.shrink_threshold = shrink_threshold
         if hidden_dims is None:
             hidden = max(64, min(256, input_dim * 2))
             hidden_dims = [hidden]
-            
+
         enc_layers = []
         in_d = input_dim
         for h in hidden_dims:
-            enc_layers.extend([nn.Linear(in_d, h), nn.BatchNorm1d(h), nn.ReLU()])
+            enc_layers.extend([nn.Linear(in_d, h), _BatchNorm1dAllowSingle(h), nn.ReLU()])
             if dropout > 0:
                 enc_layers.append(nn.Dropout(dropout))
             in_d = h
         enc_layers.append(nn.Linear(in_d, latent_dim))
         self.encoder = nn.Sequential(*enc_layers)
-        
+
         self.memory = nn.Parameter(torch.randn(memory_size, latent_dim) * 0.05)
-        
+
         dec_layers = []
         in_d = latent_dim
         for h in reversed(hidden_dims):
-            dec_layers.extend([nn.Linear(in_d, h), nn.BatchNorm1d(h), nn.ReLU()])
+            dec_layers.extend([nn.Linear(in_d, h), _BatchNorm1dAllowSingle(h), nn.ReLU()])
             if dropout > 0:
                 dec_layers.append(nn.Dropout(dropout))
             in_d = h
@@ -50,6 +82,8 @@ class MemAE(nn.Module):
         return x_hat, z, z_hat, attn
 
     def memory_diversity_loss(self) -> torch.Tensor:
+        if self.memory.shape[0] < 2:
+            return self.memory.new_tensor(0.0)
         normed = F.normalize(self.memory, dim=1)
         sim = torch.matmul(normed, normed.t())
         mask = ~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
@@ -64,6 +98,12 @@ def memae_loss(
     diversity_loss: torch.Tensor | None = None,
     diversity_weight: float = 0.0,
 ):
+    if x_hat.shape != x.shape:
+        raise ValueError(f"x_hat shape {tuple(x_hat.shape)} must match x shape {tuple(x.shape)}")
+    if attn.dim() != 2 or attn.shape[0] != x.shape[0]:
+        raise ValueError(
+            f"attn shape {tuple(attn.shape)} must be [batch_size, memory_size] for batch_size={x.shape[0]}"
+        )
     recon = F.mse_loss(x_hat, x)
     entropy = (-attn * torch.log(attn + 1e-12)).sum(dim=1).mean()
     diversity = diversity_loss if diversity_loss is not None else recon.new_tensor(0.0)

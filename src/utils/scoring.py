@@ -37,11 +37,26 @@ def predict_prob(model: Any, X: np.ndarray) -> np.ndarray:
 
 
 def predict_prob_batched(model: Any, X: np.ndarray, batch_size: int = 100_000) -> np.ndarray:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
     out = np.empty(len(X), dtype=np.float32)
     for start in range(0, len(X), batch_size):
         end = min(start + batch_size, len(X))
         out[start:end] = predict_prob(model, X[start:end]).astype(np.float32)
     return out
+
+
+def _as_1d_array(name: str, values: np.ndarray, dtype: Any | None = None) -> np.ndarray:
+    arr = np.asarray(values, dtype=dtype)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be a 1D array, got shape {arr.shape}")
+    return arr
+
+
+def _validate_same_length(**arrays: np.ndarray) -> None:
+    lengths = {name: len(values) for name, values in arrays.items()}
+    if len(set(lengths.values())) > 1:
+        raise ValueError(f"Input lengths must match, got {lengths}")
 
 
 def threshold_for_fpr(
@@ -50,9 +65,21 @@ def threshold_for_fpr(
     add_jitter: bool = False,
     fallback_mode: str = "nextafter",
 ) -> dict[str, float]:
+    target_fpr = float(target_fpr)
+    if not 0.0 <= target_fpr <= 1.0:
+        raise ValueError("target_fpr must be between 0 and 1")
+    benign_score = _as_1d_array("benign_score", benign_score, dtype=np.float64)
     if benign_score.size == 0:
         raise ValueError("benign_score must not be empty")
-    score_to_use = np.asarray(benign_score, dtype=np.float64)
+    if not np.isfinite(benign_score).all():
+        raise ValueError("benign_score must contain only finite values")
+    if target_fpr == 0.0:
+        return {
+            "threshold": float(np.nextafter(float(np.max(benign_score)), np.inf)),
+            "calibration_fpr": 0.0,
+            "target_fpr": target_fpr,
+        }
+    score_to_use = benign_score
     if add_jitter and np.unique(score_to_use).size <= 10:
         rng = np.random.default_rng(42)
         score_to_use = score_to_use + rng.uniform(0, 1e-7, size=score_to_use.size)
@@ -67,6 +94,9 @@ def threshold_for_fpr(
         if fallback_mode == "percentile":
             threshold = float(np.percentile(score_to_use, 100.0 * (1.0 - target_fpr)))
             actual_fpr = float((benign_score >= threshold).mean())
+            if actual_fpr > target_fpr:
+                threshold = float(np.nextafter(float(np.max(benign_score)), np.inf))
+                actual_fpr = 0.0
         elif fallback_mode == "nextafter":
             threshold = float(np.nextafter(float(np.max(benign_score)), np.inf))
             actual_fpr = 0.0
@@ -75,10 +105,14 @@ def threshold_for_fpr(
     else:
         threshold = float(thresholds[valid[0]])
         actual_fpr = float((benign_score >= threshold).mean())
-    return {"threshold": threshold, "calibration_fpr": actual_fpr, "target_fpr": float(target_fpr)}
+    return {"threshold": threshold, "calibration_fpr": actual_fpr, "target_fpr": target_fpr}
 
 
 def metrics_from_pred(y_true: np.ndarray, family: np.ndarray, pred: np.ndarray) -> dict[str, Any]:
+    y_true = _as_1d_array("y_true", y_true)
+    family = _as_1d_array("family", family)
+    pred = _as_1d_array("pred", pred)
+    _validate_same_length(y_true=y_true, family=family, pred=pred)
     tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
     attack_mask = family != "benign"
     return {
@@ -95,6 +129,8 @@ def metrics_from_pred(y_true: np.ndarray, family: np.ndarray, pred: np.ndarray) 
 
 
 def metrics_at_threshold(y_true: np.ndarray, family: np.ndarray, score: np.ndarray, threshold: float) -> dict[str, Any]:
+    score = _as_1d_array("score", score)
+    _validate_same_length(y_true=np.asarray(y_true), family=np.asarray(family), score=score)
     pred = (score >= threshold).astype("int64")
     return {"threshold": float(threshold), **metrics_from_pred(y_true, family, pred)}
 
@@ -110,10 +146,16 @@ def calibration_benign_scores(
     val_score: np.ndarray,
     test_seen_score: np.ndarray,
 ) -> np.ndarray:
-    val_benign = val_score[val["family"] == "benign"]
+    val_score = _as_1d_array("val_score", val_score)
+    test_seen_score = _as_1d_array("test_seen_score", test_seen_score)
+    val_family = _as_1d_array("val_family", val["family"])
+    test_seen_family = _as_1d_array("test_seen_family", test_seen["family"])
+    _validate_same_length(val_family=val_family, val_score=val_score)
+    _validate_same_length(test_seen_family=test_seen_family, test_seen_score=test_seen_score)
+    val_benign = val_score[val_family == "benign"]
     if mode == "val_only":
         return val_benign
     if mode == "val_plus_test_seen_benign":
-        seen_benign = test_seen_score[test_seen["family"] == "benign"]
+        seen_benign = test_seen_score[test_seen_family == "benign"]
         return np.concatenate([val_benign, seen_benign])
     raise ValueError(f"Unknown calibration_mode: {mode}")

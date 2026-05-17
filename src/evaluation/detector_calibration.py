@@ -27,6 +27,16 @@ def _load_split(processed_dir: Path, feature_dir: Path, split: str) -> dict[str,
     }
 
 
+def _validation_split_name(processed_dir: Path, feature_dir: Path) -> str:
+    if (
+        (feature_dir / "F_model_selection_val.npy").exists()
+        and (processed_dir / "y_model_selection_val.npy").exists()
+        and (processed_dir / "family_model_selection_val.npy").exists()
+    ):
+        return "model_selection_val"
+    return "val"
+
+
 def _make_score_row(
     model_name: str,
     score_key: str,
@@ -62,6 +72,7 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
         f"# Detector Calibration Report: {report['experiment']}",
         "",
         f"- Calibration mode: `{report['calibration_mode']}`",
+        f"- Validation split: `{report['validation_split']}`",
         f"- FPR cap: `{report['max_observed_test_fpr']:.6f}`",
         "- Thresholds are selected from calibration benign scores only and evaluated unchanged on `test_zero_day`.",
         "",
@@ -123,7 +134,8 @@ def generate_detector_calibration_report(
     processed_schema = read_json(processed_schema_path) if processed_schema_path.exists() else {}
     feature_schema = read_json(feature_schema_path) if feature_schema_path.exists() else {}
 
-    val = _load_split(processed_dir, feature_dir, "val")
+    validation_split = _validation_split_name(processed_dir, feature_dir)
+    val = _load_split(processed_dir, feature_dir, validation_split)
     test_seen = _load_split(processed_dir, feature_dir, "test_seen")
     test_zero_day = _load_split(processed_dir, feature_dir, "test_zero_day")
     xgb_val_score = predict_prob(model, val["F"])
@@ -228,6 +240,7 @@ def generate_detector_calibration_report(
         "feature_set": feature_set,
         "xgboost_artifact": xgboost_artifact,
         "benchmark_mode": processed_schema.get("benchmark_mode") or feature_schema.get("processed_benchmark_mode"),
+        "validation_split": validation_split,
         "processed_feature_count": len(processed_schema.get("feature_order", [])),
         "memae_input_dim": feature_schema.get("D_value"),
         "threshold_fit_scope": "calibration benign only",

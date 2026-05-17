@@ -133,7 +133,7 @@ def add_window_features(df: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.Da
         if cfg["include_unique_destination_port"] or cfg["include_destination_port_count"] or cfg.get("include_port_diversity") or cfg.get("include_dest_concentration"):
             ports = df_sorted.loc[idxs, dest_port_col].fillna(-1).to_numpy(dtype=np.int32)
             port_counts, unique_counts = window_port_stats(ports, window_sizes)
-        if dest_ip_col:
+        if dest_ip_col and dest_ip_col in df_sorted.columns:
             dest_ips = df_sorted.loc[idxs, dest_ip_col].fillna("missing").astype(str).to_numpy()
             if cfg.get("include_botnet_context"):
                 dest_counts_by_window = window_value_counts(dest_ips, window_sizes)

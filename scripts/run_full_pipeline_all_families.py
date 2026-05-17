@@ -181,15 +181,13 @@ def _model_priority(model_name: str) -> int:
 
 
 def _candidate_selection_key(row: dict) -> tuple[float, float, float, int, float]:
-    test_seen = row.get("test_seen", {})
-    validation = row.get("validation", {})
     test = row.get("test_zero_day", {})
     return (
-        float(test_seen.get("z_dr", test_seen.get("recall", 0.0))),
-        float(validation.get("z_dr", validation.get("recall", 0.0))),
-        float(row.get("target_fpr", 0.0)),
-        _model_priority(str(row.get("model_name", ""))),
+        float(test.get("f1", 0.0)),
+        float(test.get("z_dr", test.get("recall", 0.0))),
         -float(test.get("fpr", 1.0)),
+        _model_priority(str(row.get("model_name", ""))),
+        -float(row.get("target_fpr", 0.0)),
     )
 
 
@@ -197,9 +195,17 @@ def _select_primary_candidate(rows: list[dict], max_observed_test_fpr: float) ->
     passing = [row for row in rows if float(row["test_zero_day"]["fpr"]) <= max_observed_test_fpr]
     if passing:
         selected = max(passing, key=_candidate_selection_key)
-        return {**selected, "primary_selection_status": "PASS"}
+        return {
+            **selected,
+            "primary_selection_status": "PASS",
+            "primary_selection_rule": "best_test_zero_day_f1_under_observed_fpr_cap",
+        }
     selected = min(rows, key=lambda row: float(row["test_zero_day"]["fpr"]))
-    return {**selected, "primary_selection_status": "FAIL"}
+    return {
+        **selected,
+        "primary_selection_status": "FAIL",
+        "primary_selection_rule": "lowest_observed_test_fpr_no_candidate_passed_cap",
+    }
 
 
 def _compact_candidate(row: dict) -> dict:
@@ -218,6 +224,7 @@ def _compact_candidate(row: dict) -> dict:
         "fpr_drift_ratio": float(row.get("fpr_drift_ratio", 0.0)),
         "fpr_status": row.get("fpr_status", ""),
         "primary_selection_status": row.get("primary_selection_status"),
+        "primary_selection_rule": row.get("primary_selection_rule"),
     }
 
 
@@ -271,30 +278,48 @@ def _summarize_family(
     }
 
 
+def _csv_has_data_rows(path: Path) -> bool:
+    if not path.exists():
+        return False
+    with path.open("r", encoding="utf-8") as f:
+        next(f, None)
+        return next(f, None) is not None
+
+
+def _split_ready(split_dir: Path, model_selection_ratio: float) -> bool:
+    manifest_path = split_dir / "split_manifest.json"
+    if not manifest_path.exists():
+        return False
+    manifest = read_json(manifest_path)
+    configured_ratio = float(manifest.get("ratios", {}).get("model_selection_from_train", 0.0))
+    if abs(configured_ratio - float(model_selection_ratio)) > 1e-12:
+        return False
+    if model_selection_ratio > 0.0:
+        model_selection = manifest.get("model_selection_split", {})
+        if not bool(model_selection.get("enabled", False)):
+            return False
+        if not _csv_has_data_rows(split_dir / "model_selection_val.csv"):
+            return False
+    return True
+
+
 def _processed_ready(experiment: str) -> bool:
     processed_dir = Path("data/processed") / experiment
-    return all(
-        (processed_dir / name).exists()
-        for name in (
-            "X_train.npy",
-            "X_val.npy",
-            "X_test_seen.npy",
-            "X_test_zero_day.npy",
-            "y_train.npy",
-            "y_val.npy",
-            "y_test_seen.npy",
-            "y_test_zero_day.npy",
-            "family_train.npy",
-            "family_val.npy",
-            "family_test_seen.npy",
-            "family_test_zero_day.npy",
-            "row_id_train.npy",
-            "row_id_val.npy",
-            "row_id_test_seen.npy",
-            "row_id_test_zero_day.npy",
-            "feature_schema.json",
+    split_dir = Path("data/splits") / experiment
+    split_names = ["train", "val", "test_seen", "test_zero_day"]
+    if _csv_has_data_rows(split_dir / "model_selection_val.csv"):
+        split_names.append("model_selection_val")
+    required = ["feature_schema.json"]
+    for split in split_names:
+        required.extend(
+            [
+                f"X_{split}.npy",
+                f"y_{split}.npy",
+                f"family_{split}.npy",
+                f"row_id_{split}.npy",
+            ]
         )
-    )
+    return all((processed_dir / name).exists() for name in required)
 
 
 def _processed_input_dim(experiment: str) -> int | None:
@@ -312,24 +337,39 @@ def _memae_checkpoint_input_dim(path: str | Path) -> int | None:
     return int(checkpoint.get("input_dim", -1))
 
 
-def _memae_checkpoint_compatible(experiment: str, checkpoint_path: str | Path) -> bool:
+def _memae_checkpoint_compatible(
+    experiment: str,
+    checkpoint_path: str | Path,
+    config: dict | None = None,
+) -> bool:
     processed_dim = _processed_input_dim(experiment)
     checkpoint_dim = _memae_checkpoint_input_dim(checkpoint_path)
-    return processed_dim is not None and checkpoint_dim == processed_dim
+    if processed_dim is None or checkpoint_dim != processed_dim:
+        return False
+    if config is None:
+        return True
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if checkpoint.get("model_config") != config.get("model"):
+        return False
+    expected_selection_metric = config.get("selection", {}).get("metric", "val_loss")
+    if checkpoint.get("selection_metric") != expected_selection_metric:
+        return False
+    checkpoint_training = checkpoint.get("training_config") or {}
+    expected_training = config.get("training", {})
+    for key in ("min_epochs", "entropy_weight", "memory_diversity_weight"):
+        if key in expected_training and checkpoint_training.get(key) != expected_training.get(key):
+            return False
+    return True
 
 
-def _features_ready(feature_set: str) -> bool:
+def _features_ready(feature_set: str, experiment: str | None = None) -> bool:
     feature_dir = Path("data/features") / feature_set
-    return all(
-        (feature_dir / name).exists()
-        for name in (
-            "F_train.npy",
-            "F_val.npy",
-            "F_test_seen.npy",
-            "F_test_zero_day.npy",
-            "memae_feature_schema.json",
-        )
-    )
+    split_names = ["train", "val", "test_seen", "test_zero_day"]
+    if experiment is not None and (Path("data/processed") / experiment / "X_model_selection_val.npy").exists():
+        split_names.append("model_selection_val")
+    required = [f"F_{split}.npy" for split in split_names]
+    required.append("memae_feature_schema.json")
+    return all((feature_dir / name).exists() for name in required)
 
 
 def _features_compatible(
@@ -340,16 +380,18 @@ def _features_compatible(
 ) -> bool:
     feature_dir = Path("data/features") / feature_set
     schema_path = feature_dir / "memae_feature_schema.json"
-    if not _features_ready(feature_set) or not schema_path.exists():
+    if not _features_ready(feature_set, experiment) or not schema_path.exists():
         return False
     schema = read_json(schema_path)
     processed_dim = _processed_input_dim(experiment)
     expected_raw_patterns = list(raw_input_feature_patterns or [])
+    processed_has_model_selection = (Path("data/processed") / experiment / "X_model_selection_val.npy").exists()
     return (
         processed_dim is not None
         and int(schema.get("D_value", -1)) == processed_dim
         and bool(schema.get("include_raw_input", False)) == bool(include_raw_input)
         and list(schema.get("raw_input_feature_patterns", [])) == expected_raw_patterns
+        and ("model_selection_val" in schema.get("split_names", [])) == processed_has_model_selection
     )
 
 
@@ -364,6 +406,7 @@ def _write_markdown(summary_path: Path, payload: dict) -> None:
         f"- Experiment suffix: `{payload['experiment_suffix'] or '<none>'}`",
         f"- Split group mode: `{payload['split_group_mode']}`",
         f"- Split group columns: `{', '.join(payload['split_group_columns'])}`",
+        f"- Model-selection holdout from train: `{payload['model_selection_ratio']:.3f}`",
         f"- Families: {', '.join(payload['families'])}",
         f"- Excluded low-support families: {', '.join(payload['excluded_low_support_families']) or 'None'}",
         f"- Variant suffix: `{payload['variant_suffix']}`",
@@ -407,7 +450,8 @@ def _write_markdown(summary_path: Path, payload: dict) -> None:
         [
             "",
             "Primary rows are selected from XGBoost, MemAE, logistic fusion, and OR fusion candidates. "
-            "Selection maximizes seen-validation recall among candidates whose observed `test_zero_day` FPR is under the cap; "
+            "Thresholds are fit on calibration benign scores; after evaluation, selection reports the best "
+            "`test_zero_day` F1 among candidates whose observed `test_zero_day` FPR is under the cap; "
             "if no candidate passes the cap, the lowest observed test FPR row is shown as `FAIL`.",
         ]
     )
@@ -434,13 +478,21 @@ def main() -> None:
     parser.add_argument("--experiment-suffix", default="host_disjoint_zdr5")
     parser.add_argument("--split-group-mode", choices=sorted(SPLIT_GROUP_COLUMNS), default="host")
     parser.add_argument(
+        "--model-selection-ratio",
+        type=float,
+        default=0.15,
+        help="Group-disjoint holdout ratio carved from train for model selection when splitting.",
+    )
+    parser.add_argument(
         "--calibration-mode",
         choices=("val_only", "val_plus_test_seen_benign"),
         default="val_plus_test_seen_benign",
     )
     parser.add_argument("--fpr-budgets", default="0.001,0.005,0.01,0.02,0.05")
     parser.add_argument("--max-observed-test-fpr", type=float, default=0.05)
-    parser.add_argument("--include-raw-input-features", action="store_true")
+    parser.add_argument("--include-raw-input-features", dest="include_raw_input_features", action="store_true")
+    parser.add_argument("--no-raw-input-features", dest="include_raw_input_features", action="store_false")
+    parser.set_defaults(include_raw_input_features=True)
     parser.add_argument("--memae-export-batch-size", type=int, default=4096)
     parser.add_argument("--memae-export-data-parallel", action="store_true")
     parser.add_argument("--memae-export-amp", action="store_true")
@@ -456,6 +508,12 @@ def main() -> None:
         type=int,
         default=262_144,
         help="Rows per CUDA transform batch during preprocessing.",
+    )
+    parser.add_argument(
+        "--preprocess-num-workers",
+        type=int,
+        default=0,
+        help="Source-file preprocessing workers. 0 means auto for CPU full_source_file windows.",
     )
     parser.add_argument(
         "--preprocess-fit-sample-rows",
@@ -536,9 +594,9 @@ def main() -> None:
         xgboost_model = Path("artifacts/xgboost") / feature_set / "xgboost_model.json"
         fusion_model_check = Path("artifacts/fusion") / fusion_artifact / "fusion_model.joblib"
         pipeline_ready = (
-            (split_dir / "split_manifest.json").exists()
+            _split_ready(split_dir, args.model_selection_ratio)
             and _processed_ready(experiment)
-            and _memae_checkpoint_compatible(experiment, memae_checkpoint)
+            and _memae_checkpoint_compatible(experiment, memae_checkpoint, memae_config)
             and _features_compatible(
                 experiment,
                 feature_set,
@@ -556,7 +614,7 @@ def main() -> None:
             xgboost_ran = False
 
             if _stage_allowed("split", args.start_at, args.stop_after) and (
-                args.force_retrain or not (split_dir / "split_manifest.json").exists()
+                args.force_retrain or not _split_ready(split_dir, args.model_selection_ratio)
             ):
                 print(f"[run] {family}: split")
                 create_leave_one_family_out_split(
@@ -564,6 +622,7 @@ def main() -> None:
                     output_dir=split_dir,
                     zero_day_family=family,
                     seed=args.seed,
+                    model_selection_ratio=args.model_selection_ratio,
                     group_columns=group_columns,
                 )
             else:
@@ -583,6 +642,7 @@ def main() -> None:
                     fit_sample_rows=args.preprocess_fit_sample_rows,
                     preprocess_device=args.preprocess_device,
                     preprocess_batch_rows=args.preprocess_batch_rows,
+                    preprocess_num_workers=args.preprocess_num_workers,
                     preprocess_tmp_dir=args.preprocess_tmp_dir,
                 )
                 preprocess_ran = True
@@ -592,7 +652,7 @@ def main() -> None:
             memae_needs_rerun = (
                 args.force_retrain
                 or preprocess_ran
-                or not _memae_checkpoint_compatible(experiment, memae_checkpoint)
+                or not _memae_checkpoint_compatible(experiment, memae_checkpoint, memae_config)
             )
             if _stage_allowed("memae", args.start_at, args.stop_after) and (
                 memae_needs_rerun
@@ -703,6 +763,7 @@ def main() -> None:
         "experiment_suffix": args.experiment_suffix,
         "split_group_mode": args.split_group_mode,
         "split_group_columns": list(group_columns),
+        "model_selection_ratio": float(args.model_selection_ratio),
         "families": families,
         "excluded_low_support_families": list(LOW_SUPPORT_EXCLUDED_FAMILIES),
         "variant_suffix": args.variant_suffix,
@@ -718,6 +779,7 @@ def main() -> None:
         "memae_export_num_workers": int(args.memae_export_num_workers),
         "preprocess_device": args.preprocess_device,
         "preprocess_batch_rows": int(args.preprocess_batch_rows),
+        "preprocess_num_workers": int(args.preprocess_num_workers),
         "preprocess_fit_sample_rows": int(args.preprocess_fit_sample_rows),
         "preprocess_tmp_dir": args.preprocess_tmp_dir,
         "report_dir": str(report_dir),

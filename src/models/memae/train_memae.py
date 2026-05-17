@@ -12,13 +12,24 @@ from tqdm import tqdm
 
 from src.models.memae.model import MemAE, memae_loss
 from src.utils.io import ensure_dir, write_json
+from src.utils.scoring import threshold_for_fpr
 from src.utils.seed import set_global_seed
 
 logger = logging.getLogger(__name__)
 
 
 def _cuda_autocast(enabled: bool):
-    return torch.cuda.amp.autocast(enabled=True) if enabled else nullcontext()
+    if not enabled:
+        return nullcontext()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast("cuda", enabled=True)
+    return torch.cuda.amp.autocast(enabled=True)
+
+
+def _cuda_grad_scaler(enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
 def _sample(X: np.ndarray, max_samples: int | None, seed: int) -> np.ndarray:
@@ -102,14 +113,47 @@ def _memory_diversity_loss(model: torch.nn.Module) -> torch.Tensor:
     return _unwrap_model(model).memory_diversity_loss()
 
 
+def _resolve_torch_device(requested: str = "auto") -> torch.device:
+    requested = str(requested).lower()
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("training.device=cuda was requested but CUDA is not available")
+        return torch.device("cuda")
+    raise ValueError(f"Unknown training.device: {requested}")
+
+
+def _validate_xy_split(name: str, X: np.ndarray, y: np.ndarray) -> None:
+    if X.ndim != 2:
+        raise ValueError(f"X_{name} must be 2D, got shape {X.shape}")
+    if y.ndim != 1:
+        raise ValueError(f"y_{name} must be 1D, got shape {y.shape}")
+    if len(X) != len(y):
+        raise ValueError(f"X_{name} and y_{name} lengths differ: {len(X)} != {len(y)}")
+
+
+def _validation_split_name(processed_dir: Path) -> str:
+    if (processed_dir / "X_model_selection_val.npy").exists() and (processed_dir / "y_model_selection_val.npy").exists():
+        return "model_selection_val"
+    return "val"
+
+
 def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: str | None = None) -> Path:
     set_global_seed(seed)
     processed_dir = Path("data/processed") / experiment
     artifact_dir = ensure_dir(Path("artifacts/memae") / (artifact_name or experiment))
+    validation_split = _validation_split_name(processed_dir)
     X_train = np.load(processed_dir / "X_train.npy", mmap_mode="r")
     y_train = np.load(processed_dir / "y_train.npy", mmap_mode="r")
-    X_val = np.load(processed_dir / "X_val.npy", mmap_mode="r")
-    y_val = np.load(processed_dir / "y_val.npy", mmap_mode="r")
+    X_val = np.load(processed_dir / f"X_{validation_split}.npy", mmap_mode="r")
+    y_val = np.load(processed_dir / f"y_{validation_split}.npy", mmap_mode="r")
+    _validate_xy_split("train", X_train, y_train)
+    _validate_xy_split(validation_split, X_val, y_val)
+    if X_train.shape[1] != X_val.shape[1]:
+        raise ValueError(f"Train/val feature dimensions differ: {X_train.shape[1]} != {X_val.shape[1]}")
 
     train_benign = np.asarray(X_train[y_train == 0], dtype=np.float32)
     val_benign = np.asarray(X_val[y_val == 0], dtype=np.float32)
@@ -121,8 +165,12 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
     train_benign = _sample(train_benign, training_cfg.get("max_train_samples"), seed)
     val_benign = _sample(val_benign, training_cfg.get("max_val_samples"), seed + 1)
     val_attack_sample = _sample(val_seen_attack, training_cfg.get("max_val_samples"), seed + 2)
+    if len(train_benign) == 0:
+        raise ValueError("MemAE training requires at least one benign train sample")
+    if len(val_benign) == 0:
+        raise ValueError("MemAE training requires at least one benign validation sample")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_torch_device(training_cfg.get("device", "auto"))
     model_cfg = config["model"]
     base_model = MemAE(input_dim=train_benign.shape[1], **model_cfg).to(device)
     use_data_parallel = bool(training_cfg.get("data_parallel", False)) and device.type == "cuda" and torch.cuda.device_count() > 1
@@ -130,6 +178,18 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
     diversity_weight = float(training_cfg.get("memory_diversity_weight", 0.0))
     batch_size = int(training_cfg["batch_size"])
     eval_batch_size = int(training_cfg.get("eval_batch_size", batch_size))
+    epochs = int(training_cfg["epochs"])
+    patience = int(training_cfg["patience"])
+    min_epochs = int(training_cfg.get("min_epochs", 1))
+    if batch_size <= 0 or eval_batch_size <= 0:
+        raise ValueError("batch_size and eval_batch_size must be > 0")
+    if epochs <= 0:
+        raise ValueError("training.epochs must be > 0")
+    if patience <= 0:
+        raise ValueError("training.patience must be > 0")
+    if min_epochs <= 0:
+        raise ValueError("training.min_epochs must be > 0")
+    min_epochs = min(min_epochs, epochs)
     num_workers = int(training_cfg.get("num_workers", 0))
     pin_memory = bool(training_cfg.get("pin_memory", device.type == "cuda"))
     use_amp = bool(training_cfg.get("amp", False)) and device.type == "cuda"
@@ -176,8 +236,8 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
     best_epoch = -1
     stale = 0
     history = []
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    for epoch in range(1, training_cfg["epochs"] + 1):
+    scaler = _cuda_grad_scaler(use_amp)
+    for epoch in range(1, epochs + 1):
         model.train()
         train_losses = []
         for (batch,) in tqdm(train_loader, desc=f"MemAE epoch {epoch}", leave=False):
@@ -217,7 +277,7 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
 
         row = {"epoch": epoch, "train_loss": float(np.mean(train_losses)), "val_loss": float(np.mean(val_losses))}
         row["learning_rate"] = float(optimizer.param_groups[0]["lr"])
-        if selection_metric == "seen_recall_at_benign_fpr":
+        if effective_selection_metric == "seen_recall_at_benign_fpr":
             benign_score = _reconstruction_errors(
                 model,
                 val_benign,
@@ -242,11 +302,12 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
                 if len(val_attack_sample)
                 else np.array([], dtype=np.float32)
             )
-            threshold = float(np.quantile(benign_score, 1.0 - target_fpr))
-            val_fpr = float((benign_score >= threshold).mean()) if len(benign_score) else 0.0
+            selected_threshold = threshold_for_fpr(benign_score, target_fpr, fallback_mode="nextafter")
+            threshold = float(selected_threshold["threshold"])
+            val_fpr = float(selected_threshold["calibration_fpr"])
             val_seen_recall = float((attack_score >= threshold).mean()) if len(attack_score) else 0.0
             row["selection"] = {
-                "metric": selection_metric,
+                "metric": effective_selection_metric,
                 "target_fpr": target_fpr,
                 "threshold": threshold,
                 "val_benign_fpr": val_fpr,
@@ -254,18 +315,19 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
             }
         history.append(row)
         is_better = False
-        if effective_selection_metric == "seen_recall_at_benign_fpr":
-            selection_value = row["selection"]["val_seen_attack_recall"]
-            if selection_value > best_selection_value + 1e-12 or (
-                abs(selection_value - best_selection_value) <= 1e-12 and row["val_loss"] < best_val
-            ):
-                best_selection_value = selection_value
+        if epoch >= min_epochs:
+            if effective_selection_metric == "seen_recall_at_benign_fpr":
+                selection_value = row["selection"]["val_seen_attack_recall"]
+                if selection_value > best_selection_value + 1e-12 or (
+                    abs(selection_value - best_selection_value) <= 1e-12 and row["val_loss"] < best_val
+                ):
+                    best_selection_value = selection_value
+                    best_val = row["val_loss"]
+                    best_selection_summary = row["selection"]
+                    is_better = True
+            elif row["val_loss"] < best_val:
                 best_val = row["val_loss"]
-                best_selection_summary = row["selection"]
                 is_better = True
-        elif row["val_loss"] < best_val:
-            best_val = row["val_loss"]
-            is_better = True
 
         if is_better:
             best_epoch = epoch
@@ -273,15 +335,29 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
             torch.save(
                 {
                     "model_state_dict": _model_state_dict(model),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "input_dim": train_benign.shape[1],
                     "model_config": model_cfg,
+                    "training_config": dict(training_cfg),
+                    "selection_config": dict(selection_cfg),
                     "selection_metric": effective_selection_metric,
+                    "selection_summary": row.get("selection"),
+                    "train_split": "train",
+                    "validation_split": validation_split,
+                    "best_selection_value": (
+                        best_selection_value if effective_selection_metric == "seen_recall_at_benign_fpr" else None
+                    ),
+                    "epoch": epoch,
+                    "best_epoch": best_epoch,
+                    "best_val_loss": best_val,
+                    "seed": seed,
                 },
                 artifact_dir / "memae_best.pt",
             )
         else:
-            stale += 1
-            if stale >= training_cfg["patience"]:
+            stale = 0 if epoch < min_epochs else stale + 1
+            if stale >= patience:
                 break
         scheduler.step(row["val_loss"])
 
@@ -313,6 +389,8 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
         artifact_dir / "training_log.json",
         {
             "experiment": experiment,
+            "train_split": "train",
+            "validation_split": validation_split,
             "device": str(device),
             "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
             "data_parallel": bool(use_data_parallel),
@@ -321,6 +399,7 @@ def train_memae(experiment: str, config: dict, seed: int = 42, artifact_name: st
             "eval_batch_size": eval_batch_size,
             "num_workers": num_workers,
             "pin_memory": pin_memory,
+            "min_epochs": min_epochs,
             "best_epoch": best_epoch,
             "best_val_loss": best_val,
             "configured_selection_metric": selection_metric,

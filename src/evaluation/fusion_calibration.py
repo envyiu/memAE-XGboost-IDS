@@ -19,6 +19,16 @@ from src.utils.scoring import (
 )
 
 
+def _validation_split_name(processed_dir: Path, feature_dir: Path) -> str:
+    if (
+        (feature_dir / "F_model_selection_val.npy").exists()
+        and (processed_dir / "y_model_selection_val.npy").exists()
+        and (processed_dir / "family_model_selection_val.npy").exists()
+    ):
+        return "model_selection_val"
+    return "val"
+
+
 def generate_fusion_calibration_report(
     experiment: str,
     feature_set: str,
@@ -45,7 +55,8 @@ def generate_fusion_calibration_report(
     fusion = joblib.load(fusion_dir / "fusion_model.joblib")
 
     data = {}
-    for split in ("val", "test_seen", "test_zero_day"):
+    validation_split = _validation_split_name(processed_dir, feature_dir)
+    for split in (validation_split, "test_seen", "test_zero_day"):
         F = np.load(feature_dir / f"F_{split}.npy", mmap_mode="r")
         y = np.load(processed_dir / f"y_{split}.npy")
         family = np.load(processed_dir / f"family_{split}.npy", allow_pickle=True)
@@ -53,6 +64,7 @@ def generate_fusion_calibration_report(
         memae_score = np.asarray(F[:, 0], dtype=np.float32)
         fusion_score = fusion.predict_proba(_fusion_features(xgb_score, memae_score))[:, 1]
         data[split] = {"score": fusion_score, "y": y, "family": family}
+    data["val"] = data[validation_split]
 
     calibration_score = calibration_benign_scores(
         calibration_mode,
@@ -96,6 +108,7 @@ def generate_fusion_calibration_report(
         "xgboost_artifact": xgboost_artifact,
         "fusion_artifact": fusion_artifact,
         "benchmark_mode": processed_schema.get("benchmark_mode") or feature_schema.get("processed_benchmark_mode"),
+        "validation_split": validation_split,
         "processed_feature_count": len(processed_schema.get("feature_order", [])),
         "memae_input_dim": feature_schema.get("D_value"),
         "threshold_fit_scope": "calibration benign only",
@@ -114,6 +127,7 @@ def generate_fusion_calibration_report(
         + experiment
         + "\n\n"
         + f"- Calibration mode: `{calibration_mode}`\n"
+        + f"- Validation split: `{validation_split}`\n"
         + f"- FPR cap: `{max_observed_test_fpr:.6f}`\n\n"
         + markdown_table(
             render_calibration_rows(rows),

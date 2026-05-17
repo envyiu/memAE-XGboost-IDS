@@ -53,6 +53,52 @@ def _weighted_group_split(
     return allocation
 
 
+def _split_train_groups_for_model_selection(
+    df: pd.DataFrame,
+    train_groups: set[str],
+    zero_day_family: str,
+    model_selection_ratio: float,
+    seed: int,
+) -> tuple[set[str], set[str], dict[str, dict]]:
+    train_fit_groups = set(train_groups)
+    model_selection_groups: set[str] = set()
+    coverage: dict[str, dict] = {}
+    if not train_groups or model_selection_ratio <= 0:
+        return train_fit_groups, model_selection_groups, coverage
+
+    train_df = df[df["_group_key"].isin(train_groups)].copy()
+    for family, part in train_df.groupby("attack_family", sort=True):
+        if family == zero_day_family:
+            continue
+        family_group_sizes = part.groupby("_group_key").size().sort_values(ascending=False)
+        selected: set[str] = set()
+        if len(family_group_sizes) >= 2:
+            allocations = _weighted_group_split(
+                family_group_sizes,
+                {
+                    "train_fit": max(1e-12, 1.0 - model_selection_ratio),
+                    "model_selection_val": model_selection_ratio,
+                },
+                seed=seed + 17 + sum(ord(ch) for ch in str(family)),
+            )
+            selected = set(allocations["model_selection_val"])
+            if not selected:
+                selected = {str(family_group_sizes.index[-1])}
+            if selected == set(family_group_sizes.index.astype(str)):
+                selected.remove(str(family_group_sizes.index[0]))
+
+        selected &= train_fit_groups
+        train_fit_groups -= selected
+        model_selection_groups |= selected
+        selected_rows = int(family_group_sizes.loc[list(selected)].sum()) if selected else 0
+        coverage[str(family)] = {
+            "available_train_groups": int(len(family_group_sizes)),
+            "model_selection_groups": int(len(selected)),
+            "model_selection_rows": selected_rows,
+        }
+    return train_fit_groups, model_selection_groups, coverage
+
+
 def create_leave_one_family_out_split(
     clean_path: str | Path = "data/interim/cicids2017_clean.parquet",
     output_dir: str | Path = "data/splits/zero_day_dos",
@@ -62,8 +108,11 @@ def create_leave_one_family_out_split(
     val_ratio: float = 0.10,
     test_seen_ratio: float = 0.10,
     test_zero_day_benign_ratio: float = 0.10,
+    model_selection_ratio: float = 0.15,
     group_columns: tuple[str, ...] = DEFAULT_GROUP_COLUMNS,
 ) -> Path:
+    if not 0.0 <= model_selection_ratio < 1.0:
+        raise ValueError("model_selection_ratio must be >= 0 and < 1")
     read_columns = ["row_id", "attack_family", "original_label", *group_columns]
     df = pd.read_parquet(clean_path, columns=read_columns)
     output_dir = ensure_dir(output_dir)
@@ -135,6 +184,16 @@ def create_leave_one_family_out_split(
     for split_name in split_groups:
         split_groups[split_name].update(benign_allocations[split_name])
 
+    train_fit_groups, model_selection_groups, model_selection_coverage = _split_train_groups_for_model_selection(
+        df,
+        split_groups["train"],
+        zero_day_family,
+        model_selection_ratio=model_selection_ratio,
+        seed=seed,
+    )
+    split_groups["train"] = train_fit_groups
+    split_groups["model_selection_val"] = model_selection_groups
+
     split_ids = {}
     for split_name, groups in split_groups.items():
         ids = df.loc[df["_group_key"].isin(groups), "row_id"].to_numpy(copy=True)
@@ -172,7 +231,7 @@ def create_leave_one_family_out_split(
             "binary_label_counts": split_df["binary_label"].value_counts().to_dict(),
         }
 
-    for name in ("train", "val"):
+    for name in ("train", "val", "model_selection_val"):
         families_in_split = set(pd.read_csv(output_dir / f"{name}.csv")["attack_family"].unique())
         if zero_day_family in families_in_split:
             raise AssertionError(f"{zero_day_family} xuất hiện trong {name}")
@@ -192,6 +251,12 @@ def create_leave_one_family_out_split(
                 "val": val_ratio,
                 "test_seen": test_seen_ratio,
                 "test_zero_day_benign": test_zero_day_benign_ratio,
+                "model_selection_from_train": model_selection_ratio,
+            },
+            "model_selection_split": {
+                "enabled": bool(model_selection_groups),
+                "source": "train groups only",
+                "coverage_by_family": model_selection_coverage,
             },
             "splits": manifests,
         },

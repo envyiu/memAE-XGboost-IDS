@@ -17,6 +17,8 @@ binary_detection:
 training:
   max_train_samples: 600000
   max_val_samples: 150000
+  min_eval_attack_families: 2
+  min_eval_samples_per_attack_family: 10
   family_balance: true
   max_samples_per_attack_family: 80000
   benign_to_attack_ratio: 2.5

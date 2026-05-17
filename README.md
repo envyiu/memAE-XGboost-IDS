@@ -20,9 +20,10 @@ IDS2 là pipeline benchmark zero-day intrusion detection trên CIC-IDS2017. Reci
 raw CIC-IDS2017
   -> clean parquet + column schema
   -> host-disjoint LOFO split
+  -> train-fit + model_selection_val holdout carved from train groups
   -> preprocessing + window/context features
   -> MemAE train trên benign train
-  -> export MemAE-derived F_* features
+  -> export MemAE-derived F_* features + raw processed window/context features
   -> train XGBoost trên F_*
   -> train logistic score fusion
   -> detector/fusion calibration reports
@@ -30,6 +31,8 @@ raw CIC-IDS2017
 ```
 
 Preprocessing hiện có một điểm quan trọng: continuous numeric features vẫn bị quantile-clip theo train split, nhưng các context/indicator features như `ctx_*`, `is_*`, `*_is_*`, `*_indicator*` không bị clip. Điều này giữ được tín hiệu binary hiếm, ví dụ port `8080` của botnet.
+
+Split hiện tạo thêm `model_selection_val` từ train groups. MemAE/XGBoost/fusion/report sẽ ưu tiên split này cho model selection, early stopping, threshold/validation diagnostics nếu file tồn tại; `val` host-disjoint cũ vẫn được giữ như split diagnostic, không còn là điểm nghẽn khi nó có quá ít attack family.
 
 ## Chạy Local
 
@@ -92,9 +95,12 @@ reports/runs/{timestamp}_{summary_suffix}/
 | `--force-retrain` | off | Bỏ qua cache/artifact hiện có và chạy lại các stage được phép. |
 | `--clean-data` | off | Xóa `data/splits`, `data/processed`, `data/features` trước khi chạy. |
 | `--report-root` | `reports/runs` | Root chứa thư mục report cho từng run. |
-| `--include-raw-input-features` | off | Append raw processed `X_*` vào MemAE feature `F_*`. |
+| `--model-selection-ratio` | `0.15` | Tỉ lệ group trong train được giữ lại làm `model_selection_val` cho model selection/validation. |
+| `--include-raw-input-features` | on | Append raw processed `X_*` vào MemAE feature `F_*`. |
+| `--no-raw-input-features` | off | Tắt append raw processed input để chạy recipe MemAE-only cũ. |
 | `--raw-input-feature-pattern` | unset | Khi append raw input, chỉ chọn feature name chứa pattern này. Có thể truyền nhiều lần. |
 | `--preprocess-device` | `cpu` | Backend transform preprocessing: `cpu`, `cuda`, `auto`. |
+| `--preprocess-num-workers` | `0` | Số process theo `source_file` cho CPU `full_source_file`; `0` là auto. |
 | `--max-observed-test-fpr` | `0.05` | FPR cap để đánh dấu PASS/FAIL trong summary. |
 
 ## Chạy Trên Kaggle
@@ -168,4 +174,3 @@ Các test quan trọng hiện có:
 - MemAE checkpoint input dim phải khớp processed feature dim.
 - Context/indicator features không bị quantile-clip.
 - MemAE export có thể append raw processed input.
-

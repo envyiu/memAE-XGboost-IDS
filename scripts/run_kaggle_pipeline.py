@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--clean-data", action="store_true")
     parser.add_argument("--preprocess-device", choices=("cuda", "auto", "cpu"), default="cuda")
     parser.add_argument("--preprocess-batch-rows", type=int, default=524_288)
+    parser.add_argument("--preprocess-num-workers", type=int, default=0)
     parser.add_argument("--preprocess-fit-sample-rows", type=int, default=1_000_000)
     parser.add_argument("--preprocess-tmp-dir", default="/kaggle/working/ids2_preprocess_tmp")
     parser.add_argument("--memae-config", default="configs/memae_kaggle_t4x2.yaml")
@@ -73,6 +74,8 @@ def main() -> None:
         args.preprocess_device,
         "--preprocess-batch-rows",
         str(args.preprocess_batch_rows),
+        "--preprocess-num-workers",
+        str(args.preprocess_num_workers),
         "--preprocess-fit-sample-rows",
         str(args.preprocess_fit_sample_rows),
         "--preprocess-tmp-dir",

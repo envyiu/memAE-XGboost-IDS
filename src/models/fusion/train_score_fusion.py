@@ -33,6 +33,15 @@ def _fusion_features(xgb_score: np.ndarray, memae_score: np.ndarray) -> np.ndarr
     ).astype(np.float32)
 
 
+def _validation_split_name(feature_dir: Path, processed_dir: Path) -> str:
+    if (
+        (feature_dir / "F_model_selection_val.npy").exists()
+        and (processed_dir / "y_model_selection_val.npy").exists()
+    ):
+        return "model_selection_val"
+    return "val"
+
+
 def train_score_fusion(
     experiment: str,
     feature_set: str,
@@ -47,10 +56,11 @@ def train_score_fusion(
     model = xgb.XGBClassifier()
     model.load_model(xgb_dir / "xgboost_model.json")
     attach_selected_feature_indices(model, xgb_dir)
+    validation_split = _validation_split_name(feature_dir, processed_dir)
     F_train = np.load(feature_dir / "F_train.npy", mmap_mode="r")
-    F_val = np.load(feature_dir / "F_val.npy", mmap_mode="r")
+    F_val = np.load(feature_dir / f"F_{validation_split}.npy", mmap_mode="r")
     y_train = np.load(processed_dir / "y_train.npy")
-    y_val = np.load(processed_dir / "y_val.npy")
+    y_val = np.load(processed_dir / f"y_{validation_split}.npy")
 
     xgb_train = predict_prob_batched(model, F_train)
     xgb_val = predict_prob_batched(model, F_val)
@@ -75,6 +85,8 @@ def train_score_fusion(
             "feature_set": feature_set,
             "xgboost_artifact": xgboost_artifact,
             "fusion_artifact": fusion_artifact,
+            "train_split": "train",
+            "validation_split": validation_split,
             "fusion_feature_names": [
                 "xgb_score",
                 "xgb_logit",

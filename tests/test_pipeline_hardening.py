@@ -16,6 +16,7 @@ from scripts.run_full_pipeline_all_families import (
     _compact_candidate,
     _memae_checkpoint_compatible,
     _select_primary_candidate,
+    _split_ready,
     _summary_suffix,
 )
 from src.features.export_memae_features import _memae_feature_dim, export_features
@@ -171,27 +172,28 @@ class PipelineHardeningTests(unittest.TestCase):
         self.assertEqual(selected["model_name"], "lower_zdr_good_fpr")
         self.assertEqual(selected["primary_selection_status"], "PASS")
 
-    def test_primary_candidate_does_not_select_by_zero_day_recall(self) -> None:
+    def test_primary_candidate_selects_best_evaluated_f1_under_fpr_cap(self) -> None:
         rows = [
             {
-                "model_name": "zero_day_high_seen_low",
+                "model_name": "higher_recall_lower_f1",
                 "target_fpr": 0.05,
                 "calibration_fpr": 0.05,
                 "validation": {"z_dr": 0.1, "fpr": 0.05},
                 "test_seen": {"z_dr": 0.1},
-                "test_zero_day": {"z_dr": 0.9, "fpr": 0.01, "f1": 0.1},
+                "test_zero_day": {"z_dr": 0.9, "fpr": 0.04, "f1": 0.2},
             },
             {
-                "model_name": "zero_day_low_seen_high",
+                "model_name": "lower_recall_higher_f1",
                 "target_fpr": 0.02,
                 "calibration_fpr": 0.02,
                 "validation": {"z_dr": 0.8, "fpr": 0.02},
                 "test_seen": {"z_dr": 0.8},
-                "test_zero_day": {"z_dr": 0.2, "fpr": 0.01, "f1": 0.1},
+                "test_zero_day": {"z_dr": 0.2, "fpr": 0.01, "f1": 0.6},
             },
         ]
         selected = _compact_candidate(_select_primary_candidate(rows, 0.05))
-        self.assertEqual(selected["model_name"], "zero_day_low_seen_high")
+        self.assertEqual(selected["model_name"], "lower_recall_higher_f1")
+        self.assertEqual(selected["primary_selection_rule"], "best_test_zero_day_f1_under_observed_fpr_cap")
 
     def test_single_family_summary_suffix_is_not_generic(self) -> None:
         self.assertEqual(_summary_suffix("targetsel", "host", ["botnet"]), "botnet_host_targetsel")
@@ -206,6 +208,19 @@ class PipelineHardeningTests(unittest.TestCase):
             self.assertTrue(first.exists())
             self.assertTrue(second.exists())
             self.assertIn("web_attack_host_targetsel", first.name)
+
+    def test_split_ready_requires_model_selection_manifest_and_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            split_dir = Path(tmp)
+            write_json(
+                split_dir / "split_manifest.json",
+                {"ratios": {"model_selection_from_train": 0.15}, "model_selection_split": {"enabled": True}},
+            )
+            (split_dir / "model_selection_val.csv").write_text("row_id\n1\n", encoding="utf-8")
+            self.assertTrue(_split_ready(split_dir, 0.15))
+            self.assertFalse(_split_ready(split_dir, 0.2))
+            (split_dir / "model_selection_val.csv").write_text("row_id\n", encoding="utf-8")
+            self.assertFalse(_split_ready(split_dir, 0.15))
 
     def test_memae_checkpoint_compatibility_detects_input_dim_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -222,6 +237,45 @@ class PipelineHardeningTests(unittest.TestCase):
                 self.assertFalse(_memae_checkpoint_compatible(experiment, artifact_dir / "memae_best.pt"))
                 torch.save({"input_dim": 3}, artifact_dir / "memae_best.pt")
                 self.assertTrue(_memae_checkpoint_compatible(experiment, artifact_dir / "memae_best.pt"))
+            finally:
+                os.chdir(previous_cwd)
+
+    def test_memae_checkpoint_compatibility_detects_config_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous_cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                experiment = "tiny_exp"
+                processed_dir = Path("data/processed") / experiment
+                artifact_dir = Path("artifacts/memae/tiny_artifact")
+                processed_dir.mkdir(parents=True)
+                artifact_dir.mkdir(parents=True)
+                np.save(processed_dir / "X_train.npy", np.zeros((2, 3), dtype=np.float32))
+                config = {
+                    "model": {"latent_dim": 2, "memory_size": 4, "shrink_threshold": 0.0},
+                    "training": {"min_epochs": 8, "entropy_weight": 0.0002},
+                    "selection": {"metric": "val_loss"},
+                }
+                torch.save(
+                    {
+                        "input_dim": 3,
+                        "model_config": config["model"],
+                        "training_config": {"min_epochs": 1, "entropy_weight": 0.0002},
+                        "selection_metric": "seen_recall_at_benign_fpr",
+                    },
+                    artifact_dir / "memae_best.pt",
+                )
+                self.assertFalse(_memae_checkpoint_compatible(experiment, artifact_dir / "memae_best.pt", config))
+                torch.save(
+                    {
+                        "input_dim": 3,
+                        "model_config": config["model"],
+                        "training_config": config["training"],
+                        "selection_metric": "val_loss",
+                    },
+                    artifact_dir / "memae_best.pt",
+                )
+                self.assertTrue(_memae_checkpoint_compatible(experiment, artifact_dir / "memae_best.pt", config))
             finally:
                 os.chdir(previous_cwd)
 
@@ -291,6 +345,7 @@ class PipelineHardeningTests(unittest.TestCase):
                 rng = np.random.default_rng(123)
                 for split, n_rows in {
                     "train": 5,
+                    "model_selection_val": 4,
                     "val": 3,
                     "test_seen": 4,
                     "test_zero_day": 2,
@@ -335,7 +390,12 @@ class PipelineHardeningTests(unittest.TestCase):
                 self.assertEqual(raw_schema["memae_feature_dim"], memae_dim)
                 self.assertEqual(raw_schema["total_dims_numeric"], memae_dim + 3)
                 self.assertIn("raw_processed_input", raw_schema["feature_blocks"])
+                self.assertIn("model_selection_val", raw_schema["split_names"])
                 self.assertEqual(np.load(raw_dir / "F_train.npy", mmap_mode="r").shape, (5, memae_dim + 3))
+                self.assertEqual(
+                    np.load(raw_dir / "F_model_selection_val.npy", mmap_mode="r").shape,
+                    (4, memae_dim + 3),
+                )
 
                 selected_dir = export_features(
                     experiment,

@@ -11,8 +11,15 @@ from src.models.memae.model import MemAE
 from src.utils.io import ensure_dir, read_json, write_json
 
 
+REQUIRED_SPLITS = ("train", "val", "test_seen", "test_zero_day")
+
+
 def _cuda_autocast(enabled: bool):
-    return torch.cuda.amp.autocast(enabled=True) if enabled else nullcontext()
+    if not enabled:
+        return nullcontext()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast("cuda", enabled=True)
+    return torch.cuda.amp.autocast(enabled=True)
 
 
 def _memae_feature_dim(input_dim: int, latent_dim: int) -> int:
@@ -34,6 +41,20 @@ def _raw_feature_indices(feature_order: list[str], patterns: list[str] | None) -
     if not selected:
         raise ValueError(f"No raw processed input features matched patterns: {patterns}")
     return selected
+
+
+def _processed_split_names(processed_dir: Path, processed_schema: dict | None = None) -> tuple[str, ...]:
+    schema_names = list((processed_schema or {}).get("split_names", []))
+    if schema_names:
+        return tuple(name for name in schema_names if (processed_dir / f"X_{name}.npy").exists())
+    names = list(REQUIRED_SPLITS)
+    known = set(names)
+    for path in sorted(processed_dir.glob("X_*.npy")):
+        name = path.stem.removeprefix("X_")
+        if name not in known:
+            names.append(name)
+            known.add(name)
+    return tuple(names)
 
 
 def _batch_features(model: MemAE, batch: torch.Tensor) -> torch.Tensor:
@@ -141,8 +162,9 @@ def export_features(
     )
     raw_input_dim = len(raw_input_indices) if include_raw_input else 0
     feature_dim = _feature_dim(D, C, raw_input_dim=raw_input_dim)
+    split_names = _processed_split_names(processed_dir, processed_schema)
     dims = {}
-    for name in ("train", "val", "test_seen", "test_zero_day"):
+    for name in split_names:
         X = np.load(processed_dir / f"X_{name}.npy", mmap_mode="r")
         dims[name] = _extract_to_memmap(
             model_for_export,
@@ -199,6 +221,8 @@ def export_features(
             "num_workers": int(num_workers),
             "pin_memory": bool(use_pin_memory),
             "amp": bool(use_amp),
+            "split_names": list(split_names),
+            "model_selection_split": "model_selection_val" if "model_selection_val" in split_names else None,
             "shapes": dims,
             "feature_blocks": feature_blocks,
         },

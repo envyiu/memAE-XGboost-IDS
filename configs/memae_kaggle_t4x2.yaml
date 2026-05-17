@@ -5,6 +5,7 @@ model:
   shrink_threshold: 0.0078125
 training:
   epochs: 65
+  min_epochs: 8
   batch_size: 16384
   eval_batch_size: 32768
   learning_rate: 0.0005
@@ -21,5 +22,5 @@ training:
   data_parallel: true
   amp: true
 selection:
-  metric: seen_recall_at_benign_fpr
+  metric: val_loss
   target_fpr: 0.01

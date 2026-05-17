@@ -31,10 +31,14 @@ class IDSPreprocessor:
         invalid_negative_columns: list[str] | None = None,
         clip_quantiles: tuple[float, float] = (0.001, 0.999),
     ):
+        low_q, high_q = clip_quantiles
+        if not 0.0 <= low_q <= high_q <= 1.0:
+            raise ValueError("clip_quantiles must satisfy 0 <= low <= high <= 1")
         self.feature_columns = feature_columns
         self.invalid_negative_columns = invalid_negative_columns or []
+        invalid_negative_set = set(self.invalid_negative_columns)
         self.invalid_negative_indices = [
-            idx for idx, col in enumerate(self.feature_columns) if col in set(self.invalid_negative_columns)
+            idx for idx, col in enumerate(self.feature_columns) if col in invalid_negative_set
         ]
         self.no_clip_indices = [
             idx for idx, col in enumerate(self.feature_columns) if _is_no_clip_feature(col)
@@ -44,7 +48,7 @@ class IDSPreprocessor:
         self.upper_bounds_: np.ndarray | None = None
         self.pipeline = Pipeline(
             [
-                ("imputer", SimpleImputer(strategy="median")),
+                ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
                 ("scaler", StandardScaler()),
             ]
         )
@@ -66,11 +70,24 @@ class IDSPreprocessor:
             raise RuntimeError("preprocess-device=cuda nhưng CUDA không khả dụng")
         return "cpu"
 
+    def _validate_array_shape(self, X: np.ndarray) -> None:
+        if X.ndim != 2:
+            raise ValueError(f"Expected a 2D feature matrix, got shape {X.shape}")
+        if X.shape[1] != len(self.feature_columns):
+            raise ValueError(
+                f"Expected {len(self.feature_columns)} feature columns, got {X.shape[1]}"
+            )
+
     def _sanitize(self, data: pd.DataFrame | np.ndarray) -> np.ndarray:
         if isinstance(data, pd.DataFrame):
+            missing = [col for col in self.feature_columns if col not in data.columns]
+            if missing:
+                raise ValueError(f"Missing feature columns: {missing}")
             X = data[self.feature_columns].to_numpy(dtype=np.float32, copy=True)
         else:
             X = np.asarray(data, dtype=np.float32).copy()
+        self._validate_array_shape(X)
+        X[~np.isfinite(X)] = np.nan
         for idx in self.invalid_negative_indices:
             mask = X[:, idx] < 0
             if mask.any():
@@ -79,9 +96,17 @@ class IDSPreprocessor:
 
     def fit(self, data: pd.DataFrame | np.ndarray) -> "IDSPreprocessor":
         X = self._sanitize(data)
+        if X.shape[0] == 0:
+            raise ValueError("Cannot fit preprocessor on an empty matrix")
         low_q, high_q = self.clip_quantiles
-        self.lower_bounds_ = np.nanquantile(X, low_q, axis=0).astype(np.float32)
-        self.upper_bounds_ = np.nanquantile(X, high_q, axis=0).astype(np.float32)
+        all_nan = np.isnan(X).all(axis=0)
+        X_for_quantiles = X.copy() if all_nan.any() else X
+        if all_nan.any():
+            X_for_quantiles[:, all_nan] = 0.0
+        self.lower_bounds_ = np.nanquantile(X_for_quantiles, low_q, axis=0).astype(np.float32)
+        self.upper_bounds_ = np.nanquantile(X_for_quantiles, high_q, axis=0).astype(np.float32)
+        self.lower_bounds_[~np.isfinite(self.lower_bounds_)] = 0.0
+        self.upper_bounds_[~np.isfinite(self.upper_bounds_)] = 0.0
         if self.no_clip_indices:
             no_clip = np.asarray(self.no_clip_indices, dtype=np.int64)
             self.lower_bounds_[no_clip] = -np.inf
@@ -93,8 +118,12 @@ class IDSPreprocessor:
 
     def _as_float32_array(self, data: pd.DataFrame | np.ndarray, copy: bool) -> np.ndarray:
         if isinstance(data, pd.DataFrame):
+            missing = [col for col in self.feature_columns if col not in data.columns]
+            if missing:
+                raise ValueError(f"Missing feature columns: {missing}")
             return data[self.feature_columns].to_numpy(dtype=np.float32, copy=copy)
         X = np.asarray(data, dtype=np.float32)
+        self._validate_array_shape(X)
         return X.copy() if copy else X
 
     def _transform_cpu(self, data: pd.DataFrame | np.ndarray) -> np.ndarray:
@@ -127,6 +156,7 @@ class IDSPreprocessor:
             for start in range(0, X.shape[0], batch_rows):
                 end = min(start + batch_rows, X.shape[0])
                 batch = torch.as_tensor(X[start:end], dtype=torch.float32, device=device)
+                batch = torch.where(torch.isfinite(batch), batch, nan)
                 if invalid_idx.numel():
                     selected = batch[:, invalid_idx]
                     batch[:, invalid_idx] = torch.where(selected < 0, nan, selected)
