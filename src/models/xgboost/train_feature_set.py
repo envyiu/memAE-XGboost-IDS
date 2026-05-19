@@ -123,10 +123,19 @@ def _select_features(
     return selected.astype(np.int64), metadata
 
 
+def _feature_schema_path(feature_dir: Path) -> Path:
+    generic = feature_dir / "representation_feature_schema.json"
+    if generic.exists():
+        return generic
+    return feature_dir / "memae_feature_schema.json"
+
+
 def _memae_protected_feature_indices(feature_schema: dict, train_cfg: dict) -> np.ndarray:
     configured = train_cfg.get("feature_selection_protected_indices")
     if configured is not None:
         return np.asarray(configured, dtype=np.int64)
+    if feature_schema.get("architecture", "memae") != "memae":
+        return np.array([], dtype=np.int64)
     if not train_cfg.get("feature_selection_keep_memae_scalars", True):
         return np.array([], dtype=np.int64)
     memae_dim = int(feature_schema.get("memae_feature_dim", feature_schema.get("total_dims_numeric", 0)) or 0)
@@ -227,7 +236,7 @@ def train_xgboost_feature_set(
     pos = int((y_fit == 1).sum())
     scale_pos_weight = float(neg / pos) if pos else 1.0
 
-    feature_schema = read_json(feature_dir / "memae_feature_schema.json")
+    feature_schema = read_json(_feature_schema_path(feature_dir))
     protected_feature_indices = _memae_protected_feature_indices(feature_schema, train_cfg)
 
     params = dict(config["binary_detection"])

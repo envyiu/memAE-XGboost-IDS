@@ -9,6 +9,7 @@ IDS2 là pipeline benchmark zero-day intrusion detection trên CIC-IDS2017. Reci
 - Split chính: host-disjoint theo `source_file + source_ip`.
 - Window features: `configs/window_features_zdr5.yaml`.
 - MemAE: `configs/memae_targeted.yaml`.
+- TabTransformer numeric extractor: `configs/tabtrans_zdr5.yaml`.
 - XGBoost: `configs/xgboost_zdr5.yaml`.
 - Calibration: `val_plus_test_seen_benign`.
 - FPR budgets: `0.001,0.005,0.01,0.02,0.05`.
@@ -35,6 +36,8 @@ Preprocessing hiện có một điểm quan trọng: continuous numeric features
 Split hiện tạo thêm `model_selection_val` từ train groups. MemAE/XGBoost/fusion/report sẽ ưu tiên split này cho model selection, early stopping, threshold/validation diagnostics nếu file tồn tại; `val` host-disjoint cũ vẫn được giữ như split diagnostic, không còn là điểm nghẽn khi nó có quá ít attack family.
 
 Benchmark chính đã cố định là `or_fusion`: XGBoost và MemAE vẫn được train/export vì là hai nguồn score nội bộ, nhưng report chính không còn phát hành benchmark standalone cho hai model này.
+
+Nhánh thử nghiệm TabTransformer có thể dùng lại toàn bộ `data/interim`, `data/splits` và `data/processed` hiện có. Nó chỉ thay tầng representation sau preprocessing: train `src/models/tabtrans`, export latent `F_*`, train XGBoost, rồi report XGBoost-only. Nhánh này không dùng score fusion vì không có MemAE reconstruction score.
 
 ## Chạy Local
 
@@ -81,6 +84,19 @@ Chỉ sinh lại report nếu artifacts đã tồn tại:
   --stop-after reports
 ```
 
+Chạy nhánh TabTransformer từ dữ liệu processed sẵn có:
+
+```bash
+.venv/bin/python scripts/run_full_pipeline_all_families.py \
+  --architecture tabtrans \
+  --families botnet \
+  --start-at memae \
+  --stop-after reports \
+  --force-retrain
+```
+
+Với `--architecture tabtrans`, nếu không truyền `--variant-suffix`, runner dùng suffix `tabtrans_zdr5` để không ghi đè feature set/artifact MemAE cũ.
+
 Mỗi lần chạy report tạo một thư mục riêng:
 
 ```text
@@ -92,14 +108,15 @@ reports/runs/{timestamp}_{summary_suffix}/
 | Flag | Mặc định | Ý nghĩa |
 |---|---|---|
 | `--families` | `all` | Chọn `all` hoặc danh sách family cụ thể. |
+| `--architecture` | `memae` | Chọn representation backend: `memae` hoặc `tabtrans`. |
 | `--start-at` | `split` | Stage bắt đầu: `split`, `preprocess`, `memae`, `features`, `xgboost`, `fusion`, `reports`. |
 | `--stop-after` | `reports` | Stage cuối cùng cần chạy. |
 | `--force-retrain` | off | Bỏ qua cache/artifact hiện có và chạy lại các stage được phép. |
 | `--clean-data` | off | Xóa `data/splits`, `data/processed`, `data/features` trước khi chạy. |
 | `--report-root` | `reports/runs` | Root chứa thư mục report cho từng run. |
 | `--model-selection-ratio` | `0.15` | Tỉ lệ group trong train được giữ lại làm `model_selection_val` cho model selection/validation. |
-| `--include-raw-input-features` | on | Append raw processed `X_*` vào MemAE feature `F_*`. |
-| `--no-raw-input-features` | off | Tắt append raw processed input để chạy recipe MemAE-only cũ. |
+| `--include-raw-input-features` | on | Append raw processed `X_*` vào representation feature `F_*`. |
+| `--no-raw-input-features` | off | Tắt append raw processed input để chạy representation-only. |
 | `--raw-input-feature-pattern` | unset | Khi append raw input, chỉ chọn feature name chứa pattern này. Có thể truyền nhiều lần. |
 | `--preprocess-device` | `cpu` | Backend transform preprocessing: `cpu`, `cuda`, `auto`. |
 | `--preprocess-num-workers` | `0` | Số process theo `source_file` cho CPU `full_source_file`; `0` là auto. |
@@ -107,20 +124,36 @@ reports/runs/{timestamp}_{summary_suffix}/
 
 ## Chạy Trên Kaggle
 
-Nếu repo nằm ở `/kaggle/working/memAE-XGboost-IDS` và dataset nằm ở `/kaggle/input/datasets/envyiu/cicids2017`:
+Nếu đã upload nguyên thư mục `data/` lên Kaggle Dataset, runner sẽ tự tìm thư mục có đủ `data/interim`, `data/splits`, `data/processed`, symlink các thư mục này vào `/kaggle/working/memAE-XGboost-IDS/data`, rồi mặc định chạy từ stage `memae`. `data/features` vẫn nằm ở `/kaggle/working` để có thể ghi feature mới.
 
 ```bash
 cd /kaggle/working/memAE-XGboost-IDS
-python -u scripts/run_kaggle_pipeline.py --families all --clean-data --force-retrain
+python -u scripts/run_kaggle_pipeline.py \
+  --architecture tabtrans \
+  --families all \
+  --force-retrain
 ```
 
 Test nhanh một family:
 
 ```bash
-python -u scripts/run_kaggle_pipeline.py --families botnet --clean-data --force-retrain
+python -u scripts/run_kaggle_pipeline.py \
+  --architecture tabtrans \
+  --families botnet \
+  --force-retrain
 ```
 
-Runner Kaggle dùng `configs/memae_kaggle_t4x2.yaml`, `configs/xgboost_kaggle_gpu.yaml`, `--preprocess-device cuda`, temp preprocess ở `/kaggle/working/ids2_preprocess_tmp`, MemAE DataParallel/AMP, và XGBoost GPU nếu môi trường hỗ trợ.
+Nếu auto-detect không đúng dataset, truyền rõ:
+
+```bash
+python -u scripts/run_kaggle_pipeline.py \
+  --prepared-data-dir /kaggle/input/<dataset-slug>/data \
+  --architecture tabtrans \
+  --families botnet \
+  --force-retrain
+```
+
+Runner Kaggle mặc định chạy `--architecture tabtrans`, dùng `configs/tabtrans_kaggle_t4x2.yaml` và `configs/xgboost_kaggle_gpu.yaml`; nếu truyền `--architecture memae` thì dùng `configs/memae_kaggle_t4x2.yaml`. Với prepared data, `--clean-data` chỉ xóa output sinh lại (`data/features`, artifacts, reports), không xóa `splits/processed` đã symlink từ Kaggle input.
 
 ## Cấu Trúc Thư Mục
 
@@ -130,8 +163,9 @@ scripts/                  Entrypoint local/Kaggle và setup environment
 src/data/                 Clean CIC-IDS2017 và split LOFO
 src/preprocessing/        IDSPreprocessor và preprocess orchestration
 src/features/window/      Context/window feature engineering
-src/features/             Export MemAE-derived features
+src/features/             Export representation-derived features
 src/models/memae/         MemAE model + training
+src/models/tabtrans/      Numeric TabTransformer representation model + training
 src/models/xgboost/       XGBoost feature-set detector
 src/models/fusion/        Logistic score fusion
 src/evaluation/           Detector/fusion calibration reports
@@ -139,7 +173,7 @@ tests/                    Smoke/unit tests cho hardening
 data/interim/             Clean parquet và schema
 data/splits/              Split CSV theo experiment
 data/processed/           X_*, y_*, family_*, row_id_* arrays
-data/features/            F_* MemAE-derived feature arrays
+data/features/            F_* representation feature arrays
 artifacts/                Preprocessors và model artifacts
 reports/runs/             Report riêng cho từng lần chạy
 ```
@@ -154,13 +188,13 @@ reports/runs/{timestamp}_{suffix}/full_pipeline_{suffix}_summary.md
 
 Các cột chính:
 
-- `selected_model`: luôn là `or_fusion` trong benchmark chính.
+- `selected_model`: `or_fusion` với MemAE, `xgboost` với TabTransformer.
 - `observed_test_fpr`: FPR thực tế trên benign trong `test_zero_day`.
 - `zdr`: recall trên zero-day attack family.
 - `f1`: F1 trên `test_zero_day`.
 - `status`: `PASS` nếu observed FPR không vượt cap.
 
-Nên đọc thêm detector calibration report bên trong thư mục family nếu primary nhìn bất thường. Report này chỉ phát hành benchmark `or_fusion`; MemAE/XGBoost chỉ xuất hiện gián tiếp qua hai ngưỡng nội bộ của OR fusion.
+Nên đọc thêm detector calibration report bên trong thư mục family nếu primary nhìn bất thường. Nhánh MemAE phát hành benchmark `or_fusion`; nhánh TabTransformer phát hành report XGBoost-only.
 
 ## Tests
 
@@ -176,3 +210,4 @@ Các test quan trọng hiện có:
 - MemAE checkpoint input dim phải khớp processed feature dim.
 - Context/indicator features không bị quantile-clip.
 - MemAE export có thể append raw processed input.
+- TabTransformer train/export tạo schema representation riêng và không dùng fusion.

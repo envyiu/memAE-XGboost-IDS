@@ -10,11 +10,17 @@ from src.utils.io import read_yaml
 class ConfigAndCliTests(unittest.TestCase):
     def test_default_configs_load_required_sections(self) -> None:
         memae = read_yaml("configs/memae_targeted.yaml")
+        tabtrans = read_yaml("configs/tabtrans_zdr5.yaml")
+        tabtrans_kaggle = read_yaml("configs/tabtrans_kaggle_t4x2.yaml")
         xgboost = read_yaml("configs/xgboost_zdr5.yaml")
         window = read_yaml("configs/window_features_zdr5.yaml")
 
         self.assertIn("model", memae)
         self.assertIn("training", memae)
+        self.assertIn("model", tabtrans)
+        self.assertIn("training", tabtrans)
+        self.assertTrue(tabtrans_kaggle["training"]["data_parallel"])
+        self.assertTrue(tabtrans_kaggle["training"]["amp"])
         self.assertIn("binary_detection", xgboost)
         self.assertIn("threshold", xgboost)
         self.assertTrue(window["enabled"])

@@ -149,6 +149,11 @@ class PipelineHardeningTests(unittest.TestCase):
     def test_xgboost_feature_selection_keeps_memae_scalars(self) -> None:
         indices = _memae_protected_feature_indices({"D_value": 3, "C_value": 2, "memae_feature_dim": 17}, {})
         self.assertEqual(indices.tolist(), [0, 13, 14, 15])
+        tabtrans_indices = _memae_protected_feature_indices(
+            {"architecture": "tabtrans", "D_value": 3, "representation_feature_dim": 8},
+            {},
+        )
+        self.assertEqual(tabtrans_indices.tolist(), [])
 
     def test_candidate_rows_only_exposes_or_fusion_benchmarks(self) -> None:
         detector = {

@@ -73,6 +73,110 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _write_xgboost_markdown(path: Path, report: dict[str, Any]) -> None:
+    lines = [
+        f"# XGBoost Calibration Report: {report['experiment']}",
+        "",
+        f"- Calibration mode: `{report['calibration_mode']}`",
+        f"- Validation split: `{report['validation_split']}`",
+        f"- FPR cap: `{report['max_observed_test_fpr']:.6f}`",
+        "- Thresholds are selected from calibration benign scores only and evaluated unchanged on `test_zero_day`.",
+        "",
+    ]
+    columns = ["model", "target_fpr", "threshold", "cal_fpr", "val_fpr", "test_fpr", "fpr_drift_ratio", "zdr", "f1", "status"]
+    lines.append("## XGBoost Budget Grid")
+    lines.append(markdown_table(render_calibration_rows(report["xgboost_budget_grid"]), columns))
+    lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _feature_schema_path(feature_dir: Path) -> Path:
+    generic = feature_dir / "representation_feature_schema.json"
+    if generic.exists():
+        return generic
+    return feature_dir / "memae_feature_schema.json"
+
+
+def generate_xgboost_calibration_report(
+    experiment: str = "zero_day_dos",
+    feature_set: str | None = None,
+    xgboost_artifact: str | None = None,
+    calibration_mode: str = "val_plus_test_seen_benign",
+    fpr_budgets: tuple[float, ...] = DEFAULT_FPR_BUDGETS,
+    max_observed_test_fpr: float = 0.05,
+    report_dir: Path | None = None,
+) -> Path:
+    feature_set = feature_set or experiment
+    xgboost_artifact = xgboost_artifact or feature_set
+    processed_dir = Path("data/processed") / experiment
+    feature_dir = Path("data/features") / feature_set
+    xgb_dir = Path("artifacts/xgboost") / xgboost_artifact
+    report_dir = ensure_dir(report_dir or (Path("reports/metrics") / experiment))
+
+    model = xgb.XGBClassifier()
+    model.load_model(xgb_dir / "xgboost_model.json")
+    attach_selected_feature_indices(model, xgb_dir)
+    processed_schema_path = processed_dir / "feature_schema.json"
+    feature_schema_path = _feature_schema_path(feature_dir)
+    processed_schema = read_json(processed_schema_path) if processed_schema_path.exists() else {}
+    feature_schema = read_json(feature_schema_path) if feature_schema_path.exists() else {}
+
+    validation_split = _validation_split_name(processed_dir, feature_dir)
+    val = _load_split(processed_dir, feature_dir, validation_split)
+    test_seen = _load_split(processed_dir, feature_dir, "test_seen")
+    test_zero_day = _load_split(processed_dir, feature_dir, "test_zero_day")
+    xgb_val_score = predict_prob(model, val["F"])
+    xgb_seen_score = predict_prob(model, test_seen["F"])
+    xgb_test_score = predict_prob(model, test_zero_day["F"])
+    xgb_calibration = calibration_benign_scores(calibration_mode, val, test_seen, xgb_val_score, xgb_seen_score)
+
+    rows = []
+    for target_fpr in fpr_budgets:
+        selected = threshold_for_fpr(xgb_calibration, target_fpr, add_jitter=True, fallback_mode="percentile")
+        threshold = float(selected["threshold"])
+        val_pred = (xgb_val_score >= threshold).astype("int64")
+        seen_pred = (xgb_seen_score >= threshold).astype("int64")
+        test_pred = (xgb_test_score >= threshold).astype("int64")
+        row = {
+            "model_name": "xgboost",
+            "score_key": "xgboost_probability",
+            "selection_rule": f"XGBoost threshold selected at calibration FPR budget <= {target_fpr:.1%}",
+            "target_fpr": float(target_fpr),
+            "threshold": threshold,
+            "calibration_fpr": float(selected["calibration_fpr"]),
+            "validation": metrics_from_pred(val["y"], val["family"], val_pred),
+            "test_seen": metrics_from_pred(test_seen["y"], test_seen["family"], seen_pred),
+            "test_zero_day": metrics_from_pred(test_zero_day["y"], test_zero_day["family"], test_pred),
+        }
+        row["validation_fpr"] = float(row["validation"]["fpr"])
+        rows.append(with_fpr_status(row, max_observed_test_fpr))
+
+    report = {
+        "experiment": experiment,
+        "feature_set": feature_set,
+        "xgboost_artifact": xgboost_artifact,
+        "benchmark_mode": processed_schema.get("benchmark_mode") or feature_schema.get("processed_benchmark_mode"),
+        "architecture": feature_schema.get("architecture", "unknown"),
+        "validation_split": validation_split,
+        "processed_feature_count": len(processed_schema.get("feature_order", [])),
+        "representation_input_dim": feature_schema.get("D_value"),
+        "representation_feature_dim": feature_schema.get("representation_feature_dim"),
+        "threshold_fit_scope": "calibration benign only",
+        "calibration_mode": calibration_mode,
+        "fpr_budgets": list(fpr_budgets),
+        "max_observed_test_fpr": float(max_observed_test_fpr),
+        "xgboost_budget_grid": rows,
+        "candidate_rows": rows,
+    }
+
+    suffix = "" if feature_set == experiment and xgboost_artifact == experiment else f"_{xgboost_artifact}"
+    json_path = report_dir / f"xgboost_calibration_report{suffix}.json"
+    md_path = report_dir / f"xgboost_calibration_report{suffix}.md"
+    write_json(json_path, report)
+    _write_xgboost_markdown(md_path, report)
+    return json_path
+
+
 def generate_detector_calibration_report(
     experiment: str = "zero_day_dos",
     feature_set: str | None = None,
@@ -93,7 +197,7 @@ def generate_detector_calibration_report(
     model.load_model(xgb_dir / "xgboost_model.json")
     attach_selected_feature_indices(model, xgb_dir)
     processed_schema_path = processed_dir / "feature_schema.json"
-    feature_schema_path = feature_dir / "memae_feature_schema.json"
+    feature_schema_path = _feature_schema_path(feature_dir)
     processed_schema = read_json(processed_schema_path) if processed_schema_path.exists() else {}
     feature_schema = read_json(feature_schema_path) if feature_schema_path.exists() else {}
 

@@ -1,0 +1,29 @@
+experiment: host_disjoint_zdr5
+model:
+  embed_dim: 32
+  depth: 4
+  heads: 8
+  latent_dim: 128
+  ff_mult: 4
+  attn_dropout: 0.1
+  ff_dropout: 0.1
+  classifier_dropout: 0.1
+  pooling: cls_mean
+training:
+  epochs: 50
+  min_epochs: 5
+  batch_size: 4096
+  eval_batch_size: 8192
+  learning_rate: 0.0005
+  weight_decay: 0.000001
+  patience: 8
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 3
+  min_learning_rate: 0.00001
+  max_train_samples: 600000
+  max_val_samples: 150000
+  num_workers: 0
+  device: auto
+  amp: false
+selection:
+  metric: val_aucpr
