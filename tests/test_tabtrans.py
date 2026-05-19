@@ -84,6 +84,7 @@ class TabTransformerTests(unittest.TestCase):
                         "learning_rate": 0.001,
                         "weight_decay": 0.0,
                         "patience": 2,
+                        "gradient_accumulation_steps": 2,
                         "device": "cpu",
                         "num_workers": 0,
                     },
@@ -94,6 +95,9 @@ class TabTransformerTests(unittest.TestCase):
                 self.assertEqual(checkpoint["architecture"], "tabtrans")
                 self.assertEqual(checkpoint["input_dim"], 5)
                 self.assertEqual(checkpoint["validation_split"], "model_selection_val")
+                log = read_json(Path("artifacts/tabtrans") / artifact / "training_log.json")
+                self.assertEqual(log["gradient_accumulation_steps"], 2)
+                self.assertEqual(log["effective_batch_size"], 8)
 
                 feature_dir = export_tabtrans_features(
                     experiment,

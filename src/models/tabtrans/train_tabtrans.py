@@ -160,6 +160,9 @@ def train_tabtrans(experiment: str, config: dict, seed: int = 42, artifact_name:
     if patience <= 0:
         raise ValueError("training.patience must be > 0")
     min_epochs = min(max(1, min_epochs), epochs)
+    grad_accum_steps = int(training_cfg.get("gradient_accumulation_steps", 1))
+    if grad_accum_steps <= 0:
+        raise ValueError("training.gradient_accumulation_steps must be > 0")
     num_workers = int(training_cfg.get("num_workers", 0))
     pin_memory = bool(training_cfg.get("pin_memory", device.type == "cuda"))
     use_amp = bool(training_cfg.get("amp", False)) and device.type == "cuda"
@@ -204,17 +207,20 @@ def train_tabtrans(experiment: str, config: dict, seed: int = 42, artifact_name:
     for epoch in range(1, epochs + 1):
         model.train()
         train_losses: list[float] = []
-        for batch, target in tqdm(train_loader, desc=f"TabTrans epoch {epoch}", leave=False):
+        optimizer.zero_grad(set_to_none=True)
+        for step, (batch, target) in enumerate(tqdm(train_loader, desc=f"TabTrans epoch {epoch}", leave=False), start=1):
             batch = batch.to(device, non_blocking=pin_memory)
             target = target.to(device, non_blocking=pin_memory)
-            optimizer.zero_grad(set_to_none=True)
             with _cuda_autocast(use_amp):
                 logits = model(batch)
-                loss = criterion(logits, target)
+                raw_loss = criterion(logits, target)
+                loss = raw_loss / grad_accum_steps
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            train_losses.append(float(loss.detach().cpu()))
+            if step % grad_accum_steps == 0 or step == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            train_losses.append(float(raw_loss.detach().cpu()))
 
         val_loss, val_prob, metrics = _validation_scores(
             model,
@@ -312,6 +318,8 @@ def train_tabtrans(experiment: str, config: dict, seed: int = 42, artifact_name:
             "amp": bool(use_amp),
             "batch_size": batch_size,
             "eval_batch_size": eval_batch_size,
+            "gradient_accumulation_steps": grad_accum_steps,
+            "effective_batch_size": int(batch_size * grad_accum_steps),
             "num_workers": num_workers,
             "pin_memory": pin_memory,
             "min_epochs": min_epochs,

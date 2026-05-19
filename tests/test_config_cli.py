@@ -21,6 +21,11 @@ class ConfigAndCliTests(unittest.TestCase):
         self.assertIn("training", tabtrans)
         self.assertTrue(tabtrans_kaggle["training"]["data_parallel"])
         self.assertTrue(tabtrans_kaggle["training"]["amp"])
+        self.assertLessEqual(
+            tabtrans_kaggle["training"]["batch_size"],
+            tabtrans_kaggle["training"]["eval_batch_size"],
+        )
+        self.assertGreaterEqual(tabtrans_kaggle["training"]["gradient_accumulation_steps"], 2)
         self.assertIn("binary_detection", xgboost)
         self.assertIn("threshold", xgboost)
         self.assertTrue(window["enabled"])

@@ -153,7 +153,7 @@ python -u scripts/run_kaggle_pipeline.py \
   --force-retrain
 ```
 
-Runner Kaggle mặc định chạy `--architecture tabtrans`, dùng `configs/tabtrans_kaggle_t4x2.yaml` và `configs/xgboost_kaggle_gpu.yaml`; nếu truyền `--architecture memae` thì dùng `configs/memae_kaggle_t4x2.yaml`. Với prepared data, `--clean-data` chỉ xóa output sinh lại (`data/features`, artifacts, reports), không xóa `splits/processed` đã symlink từ Kaggle input.
+Runner Kaggle mặc định chạy `--architecture tabtrans`, dùng `configs/tabtrans_kaggle_t4x2.yaml` và `configs/xgboost_kaggle_gpu.yaml`; nếu truyền `--architecture memae` thì dùng `configs/memae_kaggle_t4x2.yaml`. Config TabTransformer dùng micro-batch `1024` + gradient accumulation `8` vì 2 T4 không gộp VRAM thành một GPU 30GB. Với prepared data, `--clean-data` chỉ xóa output sinh lại (`data/features`, artifacts, reports), không xóa `splits/processed` đã symlink từ Kaggle input.
 
 ## Cấu Trúc Thư Mục
 

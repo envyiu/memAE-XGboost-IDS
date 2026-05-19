@@ -136,7 +136,12 @@ def main() -> None:
     parser.add_argument("--tabtrans-config", default="configs/tabtrans_kaggle_t4x2.yaml")
     parser.add_argument("--xgboost-config", default="configs/xgboost_kaggle_gpu.yaml")
     parser.add_argument("--variant-suffix", default=None)
-    parser.add_argument("--memae-export-batch-size", type=int, default=32_768)
+    parser.add_argument(
+        "--memae-export-batch-size",
+        type=int,
+        default=None,
+        help="Feature export batch size. Default: 16384 for memae, 2048 for tabtrans.",
+    )
     args, extra = parser.parse_known_args()
 
     project_dir = Path(args.project_dir)
@@ -156,6 +161,7 @@ def main() -> None:
 
     start_at = args.start_at or ("memae" if prepared_data_dir is not None else "split")
     variant_suffix = args.variant_suffix or ("targetsel_zdr5" if args.architecture == "memae" else "tabtrans_zdr5")
+    export_batch_size = args.memae_export_batch_size or (16_384 if args.architecture == "memae" else 2_048)
 
     cmd = [
         sys.executable,
@@ -204,7 +210,7 @@ def main() -> None:
         "--preprocess-tmp-dir",
         args.preprocess_tmp_dir,
         "--memae-export-batch-size",
-        str(args.memae_export_batch_size),
+        str(export_batch_size),
         "--memae-export-data-parallel",
         "--memae-export-amp",
         "--memae-export-num-workers",
@@ -219,6 +225,7 @@ def main() -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(project_dir) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     print("Command:", " ".join(cmd), flush=True)
     proc = subprocess.Popen(cmd, cwd=project_dir, env=env)
     raise SystemExit(proc.wait())
