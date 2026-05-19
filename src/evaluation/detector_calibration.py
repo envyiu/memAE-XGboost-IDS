@@ -12,7 +12,6 @@ from src.utils.scoring import (
     DEFAULT_FPR_BUDGETS,
     attach_selected_feature_indices,
     calibration_benign_scores,
-    metrics_at_threshold,
     metrics_from_pred,
     predict_prob,
     threshold_for_fpr,
@@ -37,36 +36,6 @@ def _validation_split_name(processed_dir: Path, feature_dir: Path) -> str:
     return "val"
 
 
-def _make_score_row(
-    model_name: str,
-    score_key: str,
-    threshold: float,
-    target_fpr: float,
-    calibration_fpr: float,
-    val: dict[str, np.ndarray],
-    test_seen: dict[str, np.ndarray],
-    test_zero_day: dict[str, np.ndarray],
-    val_score: np.ndarray,
-    test_seen_score: np.ndarray,
-    test_score: np.ndarray,
-    max_observed_test_fpr: float,
-) -> dict[str, Any]:
-    validation = metrics_at_threshold(val["y"], val["family"], val_score, threshold)
-    row = {
-        "model_name": model_name,
-        "score_key": score_key,
-        "selection_rule": f"{model_name} threshold selected at calibration FPR budget <= {target_fpr:.1%}",
-        "threshold": float(threshold),
-        "calibration_fpr": float(calibration_fpr),
-        "validation_fpr": float(validation["fpr"]),
-        "target_fpr": float(target_fpr),
-        "validation": validation,
-        "test_seen": metrics_at_threshold(test_seen["y"], test_seen["family"], test_seen_score, threshold),
-        "test_zero_day": metrics_at_threshold(test_zero_day["y"], test_zero_day["family"], test_score, threshold),
-    }
-    return with_fpr_status(row, max_observed_test_fpr)
-
-
 def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     lines = [
         f"# Detector Calibration Report: {report['experiment']}",
@@ -79,12 +48,6 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     ]
 
     columns = ["model", "target_fpr", "threshold", "cal_fpr", "val_fpr", "test_fpr", "fpr_drift_ratio", "zdr", "f1", "status"]
-    lines.append("## XGBoost Fixed FPR")
-    lines.append(markdown_table(render_calibration_rows(report["xgboost_fixed_fpr"]), columns))
-    lines.append("")
-    lines.append("## MemAE Fixed FPR")
-    lines.append(markdown_table(render_calibration_rows(report["memae_fixed_fpr"]), columns))
-    lines.append("")
     lines.append("## OR Fusion Budget Grid")
     lines.append(markdown_table(render_calibration_rows(report["or_fusion_budget_grid"]), columns))
     lines.append("")
@@ -148,44 +111,6 @@ def generate_detector_calibration_report(
     xgb_calibration = calibration_benign_scores(calibration_mode, val, test_seen, xgb_val_score, xgb_seen_score)
     memae_calibration = calibration_benign_scores(calibration_mode, val, test_seen, memae_val_score, memae_seen_score)
 
-    xgb_fixed_rows = []
-    memae_fixed_rows = []
-    for target_fpr in fpr_budgets:
-        xgb_selected = threshold_for_fpr(xgb_calibration, target_fpr, add_jitter=True, fallback_mode="percentile")
-        xgb_fixed_rows.append(
-            _make_score_row(
-                "xgboost",
-                "xgb_score",
-                xgb_selected["threshold"],
-                target_fpr,
-                xgb_selected["calibration_fpr"],
-                val,
-                test_seen,
-                test_zero_day,
-                xgb_val_score,
-                xgb_seen_score,
-                xgb_test_score,
-                max_observed_test_fpr,
-            )
-        )
-        memae_selected = threshold_for_fpr(memae_calibration, target_fpr, add_jitter=True, fallback_mode="percentile")
-        memae_fixed_rows.append(
-            _make_score_row(
-                "memae",
-                "memae_reconstruction_error",
-                memae_selected["threshold"],
-                target_fpr,
-                memae_selected["calibration_fpr"],
-                val,
-                test_seen,
-                test_zero_day,
-                memae_val_score,
-                memae_seen_score,
-                memae_test_score,
-                max_observed_test_fpr,
-            )
-        )
-
     budget_pairs = []
     for total_budget in fpr_budgets:
         for ratio in np.linspace(0.0, 1.0, 11):
@@ -233,8 +158,7 @@ def generate_detector_calibration_report(
     fine_valid = [row for row in fine_rows if row["validation"]["fpr"] <= max(fpr_budgets)]
     fine_top_by_val_recall = sorted(fine_valid, key=lambda row: row["validation"]["recall"], reverse=True)[:10]
 
-    current_threshold = read_json(xgb_dir / "threshold.json")["threshold"]
-    candidate_rows = xgb_fixed_rows + memae_fixed_rows + fusion_rows
+    candidate_rows = fusion_rows
     report = {
         "experiment": experiment,
         "feature_set": feature_set,
@@ -247,9 +171,6 @@ def generate_detector_calibration_report(
         "calibration_mode": calibration_mode,
         "fpr_budgets": list(fpr_budgets),
         "max_observed_test_fpr": float(max_observed_test_fpr),
-        "xgboost_current_threshold": current_threshold,
-        "xgboost_fixed_fpr": xgb_fixed_rows,
-        "memae_fixed_fpr": memae_fixed_rows,
         "or_fusion_rule": "malicious if xgboost_score >= tx OR memae_reconstruction_error >= tm",
         "or_fusion_budget_grid": fusion_rows,
         "best_or_fusion_under_1pct_val_fpr": best_fusion,

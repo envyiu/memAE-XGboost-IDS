@@ -25,14 +25,16 @@ raw CIC-IDS2017
   -> MemAE train trên benign train
   -> export MemAE-derived F_* features + raw processed window/context features
   -> train XGBoost trên F_*
-  -> train logistic score fusion
-  -> detector/fusion calibration reports
+  -> train logistic score fusion artifact
+  -> OR fusion calibration reports
   -> per-run summary trong reports/runs/
 ```
 
 Preprocessing hiện có một điểm quan trọng: continuous numeric features vẫn bị quantile-clip theo train split, nhưng các context/indicator features như `ctx_*`, `is_*`, `*_is_*`, `*_indicator*` không bị clip. Điều này giữ được tín hiệu binary hiếm, ví dụ port `8080` của botnet.
 
 Split hiện tạo thêm `model_selection_val` từ train groups. MemAE/XGBoost/fusion/report sẽ ưu tiên split này cho model selection, early stopping, threshold/validation diagnostics nếu file tồn tại; `val` host-disjoint cũ vẫn được giữ như split diagnostic, không còn là điểm nghẽn khi nó có quá ít attack family.
+
+Benchmark chính đã cố định là `or_fusion`: XGBoost và MemAE vẫn được train/export vì là hai nguồn score nội bộ, nhưng report chính không còn phát hành benchmark standalone cho hai model này.
 
 ## Chạy Local
 
@@ -152,13 +154,13 @@ reports/runs/{timestamp}_{suffix}/full_pipeline_{suffix}_summary.md
 
 Các cột chính:
 
-- `selected_model`: candidate được chọn làm primary theo selection rule hiện tại.
+- `selected_model`: luôn là `or_fusion` trong benchmark chính.
 - `observed_test_fpr`: FPR thực tế trên benign trong `test_zero_day`.
 - `zdr`: recall trên zero-day attack family.
 - `f1`: F1 trên `test_zero_day`.
 - `status`: `PASS` nếu observed FPR không vượt cap.
 
-Nên đọc thêm detector/fusion calibration report bên trong thư mục family nếu primary nhìn bất thường. Với botnet hiện tại, MemAE candidate có thể có F1/FPR tốt hơn primary XGBoost dù summary vẫn chọn XGBoost theo rule ưu tiên seen/validation recall và model priority.
+Nên đọc thêm detector calibration report bên trong thư mục family nếu primary nhìn bất thường. Report này chỉ phát hành benchmark `or_fusion`; MemAE/XGBoost chỉ xuất hiện gián tiếp qua hai ngưỡng nội bộ của OR fusion.
 
 ## Tests
 
@@ -169,7 +171,7 @@ Nên đọc thêm detector/fusion calibration report bên trong thư mục famil
 
 Các test quan trọng hiện có:
 
-- Primary selection không được chọn theo zero-day recall.
+- Primary benchmark cố định là `or_fusion`.
 - Report directory phải là per-run và không ghi đè.
 - MemAE checkpoint input dim phải khớp processed feature dim.
 - Context/indicator features không bị quantile-clip.

@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.data.clean_cicids2017 import DEFAULT_DATA_DIR, clean_dataset
 from src.data.split_zero_day import create_leave_one_family_out_split
 from src.evaluation.detector_calibration import generate_detector_calibration_report
-from src.evaluation.fusion_calibration import generate_fusion_calibration_report
 from src.features.export_memae_features import export_features
 from src.models.fusion.train_score_fusion import train_score_fusion
 from src.models.memae.train_memae import train_memae
@@ -141,13 +140,23 @@ def _stage_allowed(stage: str, start_at: str, stop_after: str) -> bool:
     return STAGES.index(start_at) <= stage_idx <= STAGES.index(stop_after)
 
 
+def _validation_selection_key(row: dict) -> tuple[float, float, float, float]:
+    validation = row.get("validation", {})
+    return (
+        float(validation.get("f1", 0.0)),
+        float(validation.get("z_dr", validation.get("recall", 0.0))),
+        -float(validation.get("fpr", 1.0)),
+        -float(row.get("target_fpr", 0.0)),
+    )
+
+
 def _pick_budget_row(rows: list[dict], budget: float) -> dict:
-    for row in rows:
-        if abs(float(row.get("target_fpr", -1.0)) - budget) <= 1e-12:
-            return row
+    matching = [row for row in rows if abs(float(row.get("target_fpr", -1.0)) - budget) <= 1e-12]
+    if matching:
+        return max(matching, key=_validation_selection_key)
     valid = [row for row in rows if float(row.get("validation_fpr", 1.0)) <= budget]
     if valid:
-        return max(valid, key=lambda row: float(row.get("validation_fpr", 0.0)))
+        return max(valid, key=_validation_selection_key)
     return min(rows, key=lambda row: abs(float(row.get("validation_fpr", 0.0)) - budget))
 
 
@@ -158,53 +167,38 @@ def _parse_fpr_budgets(value: str) -> tuple[float, ...]:
     return budgets
 
 
-def _candidate_rows(detector: dict, fusion: dict) -> list[dict]:
-    rows = []
-    for row in detector.get("candidate_rows") or detector.get("xgboost_fixed_fpr", []):
-        rows.append({**row, "report_source": "detector"})
-    if not detector.get("candidate_rows"):
-        for key in ("memae_fixed_fpr", "or_fusion_budget_grid"):
-            for row in detector.get(key, []):
-                rows.append({**row, "report_source": "detector"})
-    for row in fusion.get("candidate_rows") or fusion.get("rows", []):
-        rows.append({**row, "report_source": "fusion"})
-    return rows
+def _candidate_rows(detector: dict) -> list[dict]:
+    rows = detector.get("candidate_rows") or detector.get("or_fusion_budget_grid", [])
+    return [{**row, "report_source": "detector"} for row in rows if row.get("model_name") == "or_fusion"]
 
 
-def _model_priority(model_name: str) -> int:
-    return {
-        "xgboost": 4,
-        "memae": 3,
-        "or_fusion": 2,
-        "logistic_fusion": 1,
-    }.get(model_name, 0)
-
-
-def _candidate_selection_key(row: dict) -> tuple[float, float, float, int, float]:
-    test = row.get("test_zero_day", {})
-    return (
-        float(test.get("f1", 0.0)),
-        float(test.get("z_dr", test.get("recall", 0.0))),
-        -float(test.get("fpr", 1.0)),
-        _model_priority(str(row.get("model_name", ""))),
-        -float(row.get("target_fpr", 0.0)),
-    )
+def _candidate_selection_key(row: dict) -> tuple[float, float, float, float]:
+    return _validation_selection_key(row)
 
 
 def _select_primary_candidate(rows: list[dict], max_observed_test_fpr: float) -> dict:
-    passing = [row for row in rows if float(row["test_zero_day"]["fpr"]) <= max_observed_test_fpr]
-    if passing:
-        selected = max(passing, key=_candidate_selection_key)
-        return {
-            **selected,
-            "primary_selection_status": "PASS",
-            "primary_selection_rule": "best_test_zero_day_f1_under_observed_fpr_cap",
-        }
-    selected = min(rows, key=lambda row: float(row["test_zero_day"]["fpr"]))
+    or_rows = [row for row in rows if row.get("model_name") == "or_fusion"]
+    if not or_rows:
+        raise ValueError("No or_fusion candidate rows found")
+    validation_passing = [
+        row
+        for row in or_rows
+        if float(row.get("validation_fpr", row.get("validation", {}).get("fpr", 1.0))) <= max_observed_test_fpr
+    ]
+    if validation_passing:
+        selected = max(validation_passing, key=_candidate_selection_key)
+        rule = "fixed_or_fusion_best_validation_f1_under_validation_fpr_cap"
+    else:
+        selected = min(
+            or_rows,
+            key=lambda row: float(row.get("validation_fpr", row.get("validation", {}).get("fpr", 1.0))),
+        )
+        rule = "fixed_or_fusion_lowest_validation_fpr_no_candidate_passed_cap"
+    status = "PASS" if float(selected["test_zero_day"]["fpr"]) <= max_observed_test_fpr else "FAIL"
     return {
         **selected,
-        "primary_selection_status": "FAIL",
-        "primary_selection_rule": "lowest_observed_test_fpr_no_candidate_passed_cap",
+        "primary_selection_status": status,
+        "primary_selection_rule": rule,
     }
 
 
@@ -246,35 +240,21 @@ def _summarize_family(
         max_observed_test_fpr=max_observed_test_fpr,
         report_dir=report_dir / experiment,
     )
-    fusion_path = generate_fusion_calibration_report(
-        experiment,
-        feature_set,
-        feature_set,
-        fusion_artifact,
-        calibration_mode=calibration_mode,
-        fpr_budgets=fpr_budgets,
-        max_observed_test_fpr=max_observed_test_fpr,
-        report_dir=report_dir / experiment,
-    )
     detector = read_json(detector_path)
-    fusion = read_json(fusion_path)
-    xgb_1pct = _pick_budget_row(detector["xgboost_fixed_fpr"], 0.01)
-    fusion_1pct = _pick_budget_row(fusion["rows"], 0.01)
-    candidates = [_compact_candidate(row) for row in _candidate_rows(detector, fusion)]
-    primary = _compact_candidate(_select_primary_candidate(_candidate_rows(detector, fusion), max_observed_test_fpr))
+    or_fusion_1pct = _pick_budget_row(detector["or_fusion_budget_grid"], 0.01)
+    candidates = [_compact_candidate(row) for row in _candidate_rows(detector)]
+    primary = _compact_candidate(_select_primary_candidate(_candidate_rows(detector), max_observed_test_fpr))
     return {
         "experiment": experiment,
         "feature_set": feature_set,
         "fusion_artifact": fusion_artifact,
         "report_paths": {
             "detector": str(detector_path),
-            "fusion": str(fusion_path),
         },
-        "xgboost_1pct": xgb_1pct["test_zero_day"],
-        "fusion_1pct": fusion_1pct["test_zero_day"],
+        "or_fusion_1pct": or_fusion_1pct["test_zero_day"],
         "primary_result": primary,
         "candidate_results": candidates,
-        "support": int(xgb_1pct["test_zero_day"]["tp"] + xgb_1pct["test_zero_day"]["fn"]),
+        "support": int(primary["test_zero_day"]["tp"] + primary["test_zero_day"]["fn"]),
     }
 
 
@@ -416,12 +396,13 @@ def _write_markdown(summary_path: Path, payload: dict) -> None:
         f"- Observed test FPR cap: `{payload['max_observed_test_fpr']:.6f}`",
         f"- Include raw processed input in MemAE features: `{payload.get('include_raw_input_features', False)}`",
         f"- Raw processed input feature patterns: `{', '.join(payload.get('raw_input_feature_patterns', [])) or '<all>'}`",
-        f"- Primary macro Z-DR under cap: `{float(np.mean(primary_zdr)):.6f}`",
-        f"- Primary worst-family Z-DR under cap: `{float(np.min(primary_zdr)):.6f}`",
+        "- Primary model: `or_fusion`",
+        f"- OR fusion macro Z-DR under cap: `{float(np.mean(primary_zdr)):.6f}`",
+        f"- OR fusion worst-family Z-DR under cap: `{float(np.min(primary_zdr)):.6f}`",
         "",
-        "## Primary Results",
+        "## OR Fusion Results",
         "",
-        "| family | support | selected_model | fpr_budget | val_fpr | test_seen_zdr | observed_test_fpr | fpr_drift_ratio | zdr | f1 | status |",
+        "| family | support | model | fpr_budget | val_fpr | test_seen_zdr | observed_test_fpr | fpr_drift_ratio | zdr | f1 | status |",
         "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in payload["results"]:
@@ -449,10 +430,9 @@ def _write_markdown(summary_path: Path, payload: dict) -> None:
     lines.extend(
         [
             "",
-            "Primary rows are selected from XGBoost, MemAE, logistic fusion, and OR fusion candidates. "
-            "Thresholds are fit on calibration benign scores; after evaluation, selection reports the best "
-            "`test_zero_day` F1 among candidates whose observed `test_zero_day` FPR is under the cap; "
-            "if no candidate passes the cap, the lowest observed test FPR row is shown as `FAIL`.",
+            "`or_fusion` is the fixed benchmark model. XGBoost and MemAE are internal score sources only; "
+            "their standalone benchmark rows are intentionally not emitted. The primary OR row is selected "
+            "from validation metrics under the validation FPR cap, then evaluated unchanged on `test_zero_day`.",
         ]
     )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -753,8 +733,7 @@ def main() -> None:
     if not summary_results:
         print(f"No reports generated because --stop-after={args.stop_after}")
         return
-    xgb_zdr = [row["xgboost_1pct"]["z_dr"] for row in summary_results]
-    fusion_zdr = [row["fusion_1pct"]["z_dr"] for row in summary_results]
+    or_fusion_1pct_zdr = [row["or_fusion_1pct"]["z_dr"] for row in summary_results]
     primary_zdr = [row["primary_result"]["test_zero_day"]["z_dr"] for row in summary_results]
     supports = [row["support"] for row in summary_results]
     payload = {
@@ -795,14 +774,11 @@ def main() -> None:
             "xgboost_config": _file_fingerprint(args.xgboost_config, hash_file=True),
         },
         "aggregate_1pct": {
-            "xgboost_macro_zdr": float(np.mean(xgb_zdr)),
-            "fusion_macro_zdr": float(np.mean(fusion_zdr)),
+            "or_fusion_1pct_macro_zdr": float(np.mean(or_fusion_1pct_zdr)),
             "primary_macro_zdr": float(np.mean(primary_zdr)),
-            "xgboost_weighted_zdr": float(np.average(xgb_zdr, weights=supports)),
-            "fusion_weighted_zdr": float(np.average(fusion_zdr, weights=supports)),
+            "or_fusion_1pct_weighted_zdr": float(np.average(or_fusion_1pct_zdr, weights=supports)),
             "primary_weighted_zdr": float(np.average(primary_zdr, weights=supports)),
-            "xgboost_worst_zdr": float(np.min(xgb_zdr)),
-            "fusion_worst_zdr": float(np.min(fusion_zdr)),
+            "or_fusion_1pct_worst_zdr": float(np.min(or_fusion_1pct_zdr)),
             "primary_worst_zdr": float(np.min(primary_zdr)),
         },
         "results": summary_results,
@@ -822,7 +798,7 @@ def main() -> None:
 
     print(f"\nReports generated in: {report_dir}")
     print(f"Summary written to: {suffixed_json_path}")
-    print("\nBenchmark Z-DR (1% FPR constraint):")
+    print("\nOR Fusion primary Z-DR:")
     for row in summary_results:
         print(f"  {row['family']:<15}: {row['primary_result']['test_zero_day']['z_dr']:.3f} (support: {row['support']})")
     

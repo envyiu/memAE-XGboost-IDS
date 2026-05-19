@@ -13,6 +13,7 @@ import torch
 from scripts.run_full_pipeline_all_families import (
     DEFAULT_FAMILIES,
     _build_report_dir,
+    _candidate_rows,
     _compact_candidate,
     _memae_checkpoint_compatible,
     _select_primary_candidate,
@@ -149,51 +150,68 @@ class PipelineHardeningTests(unittest.TestCase):
         indices = _memae_protected_feature_indices({"D_value": 3, "C_value": 2, "memae_feature_dim": 17}, {})
         self.assertEqual(indices.tolist(), [0, 13, 14, 15])
 
-    def test_primary_candidate_respects_fpr_cap(self) -> None:
+    def test_candidate_rows_only_exposes_or_fusion_benchmarks(self) -> None:
+        detector = {
+            "candidate_rows": [
+                {"model_name": "xgboost"},
+                {"model_name": "memae"},
+                {"model_name": "or_fusion"},
+            ]
+        }
+
+        rows = _candidate_rows(detector)
+
+        self.assertEqual([row["model_name"] for row in rows], ["or_fusion"])
+
+    def test_primary_candidate_is_fixed_to_or_fusion_and_respects_test_fpr_status(self) -> None:
         rows = [
             {
-                "model_name": "high_zdr_bad_fpr",
+                "model_name": "xgboost",
                 "target_fpr": 0.05,
                 "calibration_fpr": 0.05,
-                "validation": {"z_dr": 0.9, "fpr": 0.05},
-                "test_seen": {"z_dr": 0.8},
-                "test_zero_day": {"z_dr": 0.7, "fpr": 0.06, "f1": 0.1},
+                "validation": {"z_dr": 1.0, "fpr": 0.001, "f1": 1.0},
+                "test_seen": {"z_dr": 1.0},
+                "test_zero_day": {"z_dr": 1.0, "fpr": 0.001, "f1": 1.0},
             },
             {
-                "model_name": "lower_zdr_good_fpr",
+                "model_name": "or_fusion",
                 "target_fpr": 0.02,
                 "calibration_fpr": 0.02,
-                "validation": {"z_dr": 0.4, "fpr": 0.02},
+                "validation": {"z_dr": 0.4, "fpr": 0.02, "f1": 0.4},
                 "test_seen": {"z_dr": 0.3},
                 "test_zero_day": {"z_dr": 0.2, "fpr": 0.03, "f1": 0.1},
             },
         ]
+
         selected = _compact_candidate(_select_primary_candidate(rows, 0.05))
-        self.assertEqual(selected["model_name"], "lower_zdr_good_fpr")
+
+        self.assertEqual(selected["model_name"], "or_fusion")
         self.assertEqual(selected["primary_selection_status"], "PASS")
 
-    def test_primary_candidate_selects_best_evaluated_f1_under_fpr_cap(self) -> None:
+    def test_primary_candidate_selects_best_or_fusion_validation_f1_under_cap(self) -> None:
         rows = [
             {
-                "model_name": "higher_recall_lower_f1",
+                "model_name": "or_fusion",
                 "target_fpr": 0.05,
                 "calibration_fpr": 0.05,
-                "validation": {"z_dr": 0.1, "fpr": 0.05},
+                "validation": {"z_dr": 0.9, "fpr": 0.05, "f1": 0.2},
                 "test_seen": {"z_dr": 0.1},
-                "test_zero_day": {"z_dr": 0.9, "fpr": 0.04, "f1": 0.2},
+                "test_zero_day": {"z_dr": 0.9, "fpr": 0.04, "f1": 0.9},
             },
             {
-                "model_name": "lower_recall_higher_f1",
+                "model_name": "or_fusion",
                 "target_fpr": 0.02,
                 "calibration_fpr": 0.02,
-                "validation": {"z_dr": 0.8, "fpr": 0.02},
+                "validation": {"z_dr": 0.8, "fpr": 0.02, "f1": 0.6},
                 "test_seen": {"z_dr": 0.8},
-                "test_zero_day": {"z_dr": 0.2, "fpr": 0.01, "f1": 0.6},
+                "test_zero_day": {"z_dr": 0.2, "fpr": 0.01, "f1": 0.1},
             },
         ]
+
         selected = _compact_candidate(_select_primary_candidate(rows, 0.05))
-        self.assertEqual(selected["model_name"], "lower_recall_higher_f1")
-        self.assertEqual(selected["primary_selection_rule"], "best_test_zero_day_f1_under_observed_fpr_cap")
+
+        self.assertEqual(selected["target_fpr"], 0.02)
+        self.assertEqual(selected["primary_selection_rule"], "fixed_or_fusion_best_validation_f1_under_validation_fpr_cap")
 
     def test_single_family_summary_suffix_is_not_generic(self) -> None:
         self.assertEqual(_summary_suffix("targetsel", "host", ["botnet"]), "botnet_host_targetsel")
