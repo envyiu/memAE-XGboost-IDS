@@ -124,7 +124,7 @@ reports/runs/{timestamp}_{summary_suffix}/
 
 ## Chạy Trên Kaggle
 
-Nếu đã upload nguyên thư mục `data/` lên Kaggle Dataset, runner sẽ tự tìm thư mục có đủ `data/interim`, `data/splits`, `data/processed`, symlink các thư mục này vào `/kaggle/working/memAE-XGboost-IDS/data`, rồi mặc định chạy từ stage `memae`. `data/features` vẫn nằm ở `/kaggle/working` để có thể ghi feature mới.
+Nếu đã upload nguyên thư mục `data/` lên Kaggle Dataset, runner sẽ tự tìm thư mục có đủ `data/interim`, `data/splits`, `data/processed`, symlink các thư mục này vào `/kaggle/working/memAE-XGboost-IDS/data`, rồi mặc định chạy từ stage `memae`. `data/features` vẫn nằm ở `/kaggle/working` để có thể ghi feature mới, nhưng Kaggle runner mặc định xóa cache feature đầu run và xóa `data/features/{feature_set}` sau report từng family để tránh đầy disk.
 
 ```bash
 cd /kaggle/working/memAE-XGboost-IDS
@@ -153,7 +153,7 @@ python -u scripts/run_kaggle_pipeline.py \
   --force-retrain
 ```
 
-Runner Kaggle mặc định chạy `--architecture tabtrans`, dùng `configs/tabtrans_kaggle_t4x2.yaml` và `configs/xgboost_kaggle_gpu.yaml`; nếu truyền `--architecture memae` thì dùng `configs/memae_kaggle_t4x2.yaml`. Config TabTransformer dùng micro-batch `1024` + gradient accumulation `8` vì 2 T4 không gộp VRAM thành một GPU 30GB. Với prepared data, `--clean-data` chỉ xóa output sinh lại (`data/features`, artifacts, reports), không xóa `splits/processed` đã symlink từ Kaggle input.
+Runner Kaggle mặc định chạy `--architecture tabtrans`, dùng `configs/tabtrans_kaggle_t4x2.yaml` và `configs/xgboost_kaggle_gpu.yaml`; nếu truyền `--architecture memae` thì dùng `configs/memae_kaggle_t4x2.yaml`. Config TabTransformer dùng micro-batch `4096` + gradient accumulation `2` vì 2 T4 không gộp VRAM thành một GPU 30GB. Với prepared data, `--clean-data` chỉ xóa output sinh lại (`data/features`, artifacts, reports), không xóa `splits/processed` đã symlink từ Kaggle input. Nếu muốn giữ toàn bộ `F_*` để debug, truyền thêm `--keep-feature-cache`.
 
 ## Cấu Trúc Thư Mục
 

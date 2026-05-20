@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -631,6 +632,11 @@ def main() -> None:
     parser.add_argument("--allow-low-support", action="store_true")
     parser.add_argument("--force-retrain", action="store_true")
     parser.add_argument("--clean-data", action="store_true", help="Wipe all intermediate data to free up space")
+    parser.add_argument(
+        "--delete-feature-set-after-report",
+        action="store_true",
+        help="Delete data/features/{feature_set} after each family report to keep disk usage bounded.",
+    )
     args = parser.parse_args()
     if args.variant_suffix is None:
         args.variant_suffix = "targetsel_zdr5" if args.architecture == "memae" else "tabtrans_zdr5"
@@ -889,6 +895,11 @@ def main() -> None:
             )
         family_summary["family"] = family
         summary_results.append(family_summary)
+        if args.delete_feature_set_after_report:
+            feature_dir = Path("data/features") / feature_set
+            if feature_dir.exists():
+                shutil.rmtree(feature_dir)
+                print(f"[cleanup] {family}: deleted feature set {feature_dir}")
 
     if not summary_results:
         print(f"No reports generated because --stop-after={args.stop_after}")
@@ -919,6 +930,7 @@ def main() -> None:
         "memae_export_data_parallel": bool(args.memae_export_data_parallel),
         "memae_export_amp": bool(args.memae_export_amp),
         "memae_export_num_workers": int(args.memae_export_num_workers),
+        "delete_feature_set_after_report": bool(args.delete_feature_set_after_report),
         "preprocess_device": args.preprocess_device,
         "preprocess_batch_rows": int(args.preprocess_batch_rows),
         "preprocess_num_workers": int(args.preprocess_num_workers),

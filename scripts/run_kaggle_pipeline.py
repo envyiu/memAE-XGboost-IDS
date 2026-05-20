@@ -12,6 +12,7 @@ from pathlib import Path
 DEFAULT_PROJECT_DIR = "/kaggle/working/memAE-XGboost-IDS"
 DEFAULT_RAW_DATA_DIR = "/kaggle/input/datasets/envyiu/cicids2017"
 DEFAULT_KAGGLE_INPUT_DIR = "/kaggle/input"
+PIPELINE_STAGES = ("split", "preprocess", "memae", "features", "xgboost", "fusion", "reports")
 
 
 def _looks_like_prepared_data_dir(path: Path) -> bool:
@@ -111,6 +112,11 @@ def main() -> None:
     parser.add_argument("--force-retrain", action="store_true")
     parser.add_argument("--clean-data", action="store_true")
     parser.add_argument(
+        "--keep-feature-cache",
+        action="store_true",
+        help="Không xóa data/features đầu run và không xóa feature set sau từng family.",
+    )
+    parser.add_argument(
         "--prepared-data-dir",
         default="auto",
         help="Path tới thư mục data đã upload lên Kaggle. Dùng 'auto' để tự tìm trong /kaggle/input.",
@@ -160,8 +166,17 @@ def main() -> None:
         raise FileNotFoundError(f"Không tìm thấy raw-data-dir: {raw_data_dir}")
 
     start_at = args.start_at or ("memae" if prepared_data_dir is not None else "split")
+    if start_at not in PIPELINE_STAGES or args.stop_after not in PIPELINE_STAGES:
+        raise ValueError(f"--start-at/--stop-after must be one of: {', '.join(PIPELINE_STAGES)}")
     variant_suffix = args.variant_suffix or ("targetsel_zdr5" if args.architecture == "memae" else "tabtrans_zdr5")
     export_batch_size = args.memae_export_batch_size or (16_384 if args.architecture == "memae" else 2_048)
+    will_generate_features = PIPELINE_STAGES.index(start_at) <= PIPELINE_STAGES.index("features") <= PIPELINE_STAGES.index(args.stop_after)
+    if not args.keep_feature_cache and will_generate_features:
+        features_dir = project_dir / "data" / "features"
+        if features_dir.exists() or features_dir.is_symlink():
+            print(f"[kaggle] deleting feature cache before run: {features_dir}", flush=True)
+            _remove_path(features_dir)
+        features_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
         sys.executable,
@@ -217,6 +232,8 @@ def main() -> None:
         "0",
         *extra,
     ]
+    if not args.keep_feature_cache:
+        cmd.append("--delete-feature-set-after-report")
     if args.force_retrain:
         cmd.append("--force-retrain")
     if args.clean_data and prepared_data_dir is None:
